@@ -173,52 +173,63 @@ impl Client {
     /// Reads guest physical memory into each `(address, buffer)` pair, in as few requests as the
     /// message size allows (several ranges per request, about 60 KiB of data per request).
     ///
-    /// Returns a VirtualBox status per guest page that the ranges overlap, in order: 0 if the
-    /// page was read, otherwise why it is unreadable (`VERR_PGM_PHYS_PAGE_RESERVED` -1618 for
-    /// MMIO, `VERR_PGM_INVALID_GC_PHYSICAL_ADDRESS` -1605 for no memory). Unreadable bytes are
-    /// zeros. An unreadable page is not an error.
-    pub fn read_physical(&mut self, ranges: &mut [(u64, &mut [u8])]) -> Result<Vec<i32>> {
-        let mut status = Vec::new();
+    /// Appends a VirtualBox status per guest page that the ranges overlap, in order: a
+    /// non-negative status if the page was read, otherwise why it is unreadable
+    /// (`VERR_PGM_PHYS_PAGE_RESERVED` -1618 for MMIO,
+    /// `VERR_PGM_INVALID_GC_PHYSICAL_ADDRESS` -1605 for no memory). Unreadable bytes are zeros.
+    /// An unreadable page is not an error. If a later request fails, statuses and bytes from all
+    /// completed requests are retained.
+    pub fn read_physical(
+        &mut self,
+        ranges: &mut [(u64, &mut [u8])],
+        status: &mut Vec<i32>,
+    ) -> Result<()> {
+        // Validate the complete operation before the first request. `addr + len - 1` permits a
+        // non-empty range whose final byte is u64::MAX.
+        for (addr, buf) in ranges.iter() {
+            if !buf.is_empty() && addr.checked_add(buf.len() as u64 - 1).is_none() {
+                return Err(Error::Protocol(format!(
+                    "range of {} bytes at {:#x} wraps around",
+                    buf.len(),
+                    addr
+                )));
+            }
+        }
+
         // The request being built: per wire range (index in `ranges`, offset in its buffer,
         // length, pages), and the reply size it needs.
         let mut batch: Vec<(usize, usize, usize, usize)> = Vec::new();
         let mut reply_size = 0;
         for i in 0..ranges.len() {
             let (addr, len) = (ranges[i].0, ranges[i].1.len());
-            if addr.checked_add(len as u64).is_none() {
-                return Err(Error::Protocol(format!(
-                    "range of {} bytes at {:#x} wraps around",
-                    len, addr
-                )));
-            }
-            // Page by page, merged into the previous wire range when contiguous.
             let mut off = 0;
             while off < len {
                 let page_len =
                     (len - off).min((PAGE_SIZE - (addr + off as u64) % PAGE_SIZE) as usize);
                 let cost = 4 + page_len;
-                let merge = matches!(batch.last(), Some(&(j, o, l, _)) if j == i && o + l == off);
-                let request_size = (batch.len() + usize::from(!merge)) * RANGE_SIZE;
+                let can_merge =
+                    matches!(batch.last(), Some(&(j, o, l, _)) if j == i && o + l == off);
+                let request_size = (batch.len() + usize::from(!can_merge)) * RANGE_SIZE;
                 if reply_size + cost > BODY_SIZE_MAX || request_size > BODY_SIZE_MAX {
-                    self.read_batch(ranges, &batch, &mut status)?;
+                    self.read_batch(ranges, &batch, status)?;
                     batch.clear();
                     reply_size = 0;
                 }
-                match batch.last_mut() {
-                    Some((j, o, l, pages)) if *j == i && *o + *l == off => {
-                        *l += page_len;
-                        *pages += 1;
-                    }
-                    _ => batch.push((i, off, page_len, 1)),
+                if can_merge {
+                    let (_, _, length, pages) = batch.last_mut().unwrap();
+                    *length += page_len;
+                    *pages += 1;
+                } else {
+                    batch.push((i, off, page_len, 1));
                 }
                 reply_size += cost;
                 off += page_len;
             }
         }
         if !batch.is_empty() {
-            self.read_batch(ranges, &batch, &mut status)?;
+            self.read_batch(ranges, &batch, status)?;
         }
-        Ok(status)
+        Ok(())
     }
 
     /// Sends one `VMI_MSG_PHYS_READ` for `batch` (see `read_physical`).

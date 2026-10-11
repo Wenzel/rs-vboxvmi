@@ -30,7 +30,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         .zip(pages.iter_mut())
         .map(|(&a, p)| (a & !(vboxvmi::PAGE_SIZE - 1), &mut p[..]))
         .collect();
-    let status = client.read_physical(&mut ranges)?;
+    let mut status = Vec::new();
+    client.read_physical(&mut ranges, &mut status)?;
     for ((addr, page), rc) in ranges.iter().zip(status) {
         println!("{:#014x} status {:5} {:02x?}", addr, rc, &page[..16]);
     }
