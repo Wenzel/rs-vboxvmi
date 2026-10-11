@@ -1,0 +1,12 @@
+[package]
+name = "vboxvmi"
+version = "0.1.0"
+edition = "2018"
+description = "Pure-Rust client for VBoxVMI, the introspection protocol of a patched VirtualBox, for libmicrovmi's VBoxVMI access method"
+license = "GPL-3.0-only"
+repository = "https://github.com/Wenzel/rs-vboxvmi"
+publish = false
+
+[dependencies]
+libc = "0.2"
+thiserror = "1.0"

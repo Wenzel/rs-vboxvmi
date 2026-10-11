@@ -1,0 +1,10 @@
+# vboxvmi
+
+Pure-Rust client for VBoxVMI, the introspection protocol served by a patched VirtualBox VM
+process over a per-VM Unix domain socket. Used by libmicrovmi's VBoxVMI access method.
+
+The protocol is specified in the patched VirtualBox tree (`doc/technical/VBoxVMI-protocol.md`,
+branch `vmi/vboxvmi` of https://github.com/Wenzel/virtualbox). Linux only.
+
+    VBoxManage setextradata <vm> VBoxInternal/VMI/Enabled 1   # then start the VM
+    cargo run --example handshake -- <VBox user home>/vmi/<vm uuid>.sock
