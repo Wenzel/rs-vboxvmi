@@ -207,13 +207,14 @@ impl Client {
                 let page_len =
                     (len - off).min((PAGE_SIZE - (addr + off as u64) % PAGE_SIZE) as usize);
                 let cost = 4 + page_len;
-                let can_merge =
+                let mut can_merge =
                     matches!(batch.last(), Some(&(j, o, l, _)) if j == i && o + l == off);
                 let request_size = (batch.len() + usize::from(!can_merge)) * RANGE_SIZE;
                 if reply_size + cost > BODY_SIZE_MAX || request_size > BODY_SIZE_MAX {
                     self.read_batch(ranges, &batch, status)?;
                     batch.clear();
                     reply_size = 0;
+                    can_merge = false;
                 }
                 if can_merge {
                     let (_, _, length, pages) = batch.last_mut().unwrap();
