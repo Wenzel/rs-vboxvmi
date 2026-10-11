@@ -99,10 +99,11 @@ fn decode_hello(body: &[u8]) -> Result<(u32, u32)> {
 /// A connection to the VBoxVMI server of one VM, handshake done.
 ///
 /// The server serves one client at a time; dropping the client disconnects it.
-#[derive(Debug)]
 pub struct Client {
     fd: OwnedFd,
     next_id: u32,
+    /// Receive buffer, reused for every message.
+    buf: Vec<u8>,
 }
 
 impl Client {
@@ -113,7 +114,11 @@ impl Client {
             path: path.to_path_buf(),
             source,
         })?;
-        let mut client = Client { fd, next_id: 1 };
+        let mut client = Client {
+            fd,
+            next_id: 1,
+            buf: vec![0; MSG_SIZE_MAX],
+        };
 
         // The server speaks first: it tells a refused client why.
         let (hdr, body) = client.recv()?;
@@ -131,7 +136,7 @@ impl Client {
             }
             _ => {}
         }
-        check_hello(&body)?;
+        check_hello(body)?;
 
         let mut req = [0u8; 8];
         req[0..4].copy_from_slice(&MAGIC.to_le_bytes());
@@ -140,7 +145,7 @@ impl Client {
         match hdr.rc {
             VERR_VERSION_MISMATCH => {
                 return Err(Error::VersionMismatch {
-                    server: decode_hello(&body)?.1,
+                    server: decode_hello(body)?.1,
                     client: VERSION,
                 })
             }
@@ -153,13 +158,13 @@ impl Client {
             }
             _ => {}
         }
-        check_hello(&body)?;
+        check_hello(body)?;
         Ok(client)
     }
 
-    /// Sends a request and waits for its reply. Returns the reply header and body; the caller
-    /// checks the status.
-    fn request(&mut self, kind: u16, body: &[u8]) -> Result<(Header, Vec<u8>)> {
+    /// Sends a request and waits for its reply. Returns the reply header and body (valid until
+    /// the next message); the caller checks the status.
+    fn request(&mut self, kind: u16, body: &[u8]) -> Result<(Header, &[u8])> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1); // 0 is reserved for non-replies
         let size = HDR_SIZE + body.len();
@@ -175,21 +180,32 @@ impl Client {
             kind,
             flags: 0,
             rc: 0,
-        };
-        let mut msg = Vec::with_capacity(size);
-        msg.extend_from_slice(&hdr.encode());
-        msg.extend_from_slice(body);
-        // MSG_NOSIGNAL: a server that went away is an error, not a SIGPIPE.
-        let sent = unsafe {
-            libc::send(
-                self.fd.as_raw_fd(),
-                msg.as_ptr().cast(),
-                msg.len(),
-                libc::MSG_NOSIGNAL,
-            )
-        };
-        if sent < 0 {
-            return Err(io::Error::last_os_error().into());
+        }
+        .encode();
+        // Header and body as one record, without copying them together.
+        let mut iov = [
+            libc::iovec {
+                iov_base: hdr.as_ptr() as *mut libc::c_void,
+                iov_len: hdr.len(),
+            },
+            libc::iovec {
+                iov_base: body.as_ptr() as *mut libc::c_void,
+                iov_len: body.len(),
+            },
+        ];
+        let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+        msg.msg_iov = iov.as_mut_ptr();
+        msg.msg_iovlen = iov.len() as _;
+        loop {
+            // MSG_NOSIGNAL: a server that went away is an error, not a SIGPIPE.
+            let sent = unsafe { libc::sendmsg(self.fd.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
+            if sent >= 0 {
+                break;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err.into());
+            }
         }
 
         let (reply, body) = self.recv()?;
@@ -202,38 +218,40 @@ impl Client {
         Ok((reply, body))
     }
 
-    /// Receives one message.
-    fn recv(&self) -> Result<(Header, Vec<u8>)> {
-        let mut buf = vec![0u8; MSG_SIZE_MAX];
-        // MSG_TRUNC returns the real size of an oversized message.
-        let n = unsafe {
-            libc::recv(
-                self.fd.as_raw_fd(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                libc::MSG_TRUNC,
-            )
+    /// Receives one message into the reusable buffer.
+    fn recv(&mut self) -> Result<(Header, &[u8])> {
+        let n = loop {
+            // MSG_TRUNC returns the real size of an oversized message.
+            let n = unsafe {
+                libc::recv(
+                    self.fd.as_raw_fd(),
+                    self.buf.as_mut_ptr().cast(),
+                    self.buf.len(),
+                    libc::MSG_TRUNC,
+                )
+            };
+            if n >= 0 {
+                break n as usize;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err.into());
+            }
         };
-        if n < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        let n = n as usize;
         if n == 0 {
             return Err(Error::Protocol("the server closed the connection".into()));
         }
         if !(HDR_SIZE..=MSG_SIZE_MAX).contains(&n) {
             return Err(Error::Protocol(format!("message of {} bytes", n)));
         }
-        let hdr = Header::decode(&buf);
+        let hdr = Header::decode(&self.buf);
         if hdr.size as usize != n {
             return Err(Error::Protocol(format!(
                 "header says {} bytes, got {}",
                 hdr.size, n
             )));
         }
-        buf.truncate(n);
-        buf.drain(..HDR_SIZE);
-        Ok((hdr, buf))
+        Ok((hdr, &self.buf[HDR_SIZE..n]))
     }
 }
 
