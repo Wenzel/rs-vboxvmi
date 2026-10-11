@@ -7,6 +7,7 @@
 use std::convert::TryInto;
 use std::io;
 use std::mem;
+use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -19,7 +20,14 @@ pub const VERSION: u32 = 1;
 /// Maximum size of a message, header included.
 const MSG_SIZE_MAX: usize = 64 * 1024;
 const HDR_SIZE: usize = 16;
+const BODY_SIZE_MAX: usize = MSG_SIZE_MAX - HDR_SIZE;
 const MSG_HELLO: u16 = 1;
+const MSG_PHYS_READ: u16 = 2;
+const MSG_RAM_RANGES: u16 = 3;
+/// Guest page size: physical reads have a status per guest page.
+pub const PAGE_SIZE: u64 = 4096;
+/// `VMIPHYSRANGE` and `VMIRAMRANGE` size.
+const RANGE_SIZE: usize = 16;
 const MSG_F_REPLY: u16 = 1;
 
 // VirtualBox status codes (iprt/err.h) the client tells apart.
@@ -160,6 +168,130 @@ impl Client {
         }
         check_hello(body)?;
         Ok(client)
+    }
+
+    /// Reads guest physical memory into each `(address, buffer)` pair, in as few requests as the
+    /// message size allows (several ranges per request, about 60 KiB of data per request).
+    ///
+    /// Returns a VirtualBox status per guest page that the ranges overlap, in order: 0 if the
+    /// page was read, otherwise why it is unreadable (`VERR_PGM_PHYS_PAGE_RESERVED` -1618 for
+    /// MMIO, `VERR_PGM_INVALID_GC_PHYSICAL_ADDRESS` -1605 for no memory). Unreadable bytes are
+    /// zeros. An unreadable page is not an error.
+    pub fn read_physical(&mut self, ranges: &mut [(u64, &mut [u8])]) -> Result<Vec<i32>> {
+        let mut status = Vec::new();
+        // The request being built: per wire range (index in `ranges`, offset in its buffer,
+        // length, pages), and the reply size it needs.
+        let mut batch: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut reply_size = 0;
+        for i in 0..ranges.len() {
+            let (addr, len) = (ranges[i].0, ranges[i].1.len());
+            if addr.checked_add(len as u64).is_none() {
+                return Err(Error::Protocol(format!(
+                    "range of {} bytes at {:#x} wraps around",
+                    len, addr
+                )));
+            }
+            // Page by page, merged into the previous wire range when contiguous.
+            let mut off = 0;
+            while off < len {
+                let page_len =
+                    (len - off).min((PAGE_SIZE - (addr + off as u64) % PAGE_SIZE) as usize);
+                let cost = 4 + page_len;
+                let merge = matches!(batch.last(), Some(&(j, o, l, _)) if j == i && o + l == off);
+                let request_size = (batch.len() + usize::from(!merge)) * RANGE_SIZE;
+                if reply_size + cost > BODY_SIZE_MAX || request_size > BODY_SIZE_MAX {
+                    self.read_batch(ranges, &batch, &mut status)?;
+                    batch.clear();
+                    reply_size = 0;
+                }
+                match batch.last_mut() {
+                    Some((j, o, l, pages)) if *j == i && *o + *l == off => {
+                        *l += page_len;
+                        *pages += 1;
+                    }
+                    _ => batch.push((i, off, page_len, 1)),
+                }
+                reply_size += cost;
+                off += page_len;
+            }
+        }
+        if !batch.is_empty() {
+            self.read_batch(ranges, &batch, &mut status)?;
+        }
+        Ok(status)
+    }
+
+    /// Sends one `VMI_MSG_PHYS_READ` for `batch` (see `read_physical`).
+    fn read_batch(
+        &mut self,
+        ranges: &mut [(u64, &mut [u8])],
+        batch: &[(usize, usize, usize, usize)],
+        status: &mut Vec<i32>,
+    ) -> Result<()> {
+        let mut req = Vec::with_capacity(batch.len() * RANGE_SIZE);
+        for &(i, off, len, _) in batch {
+            req.extend_from_slice(&(ranges[i].0 + off as u64).to_le_bytes());
+            req.extend_from_slice(&(len as u32).to_le_bytes());
+            req.extend_from_slice(&0u32.to_le_bytes());
+        }
+        let (hdr, body) = self.request(MSG_PHYS_READ, &req)?;
+        if hdr.rc < 0 {
+            return Err(Error::Server {
+                request: "physical read",
+                rc: hdr.rc,
+            });
+        }
+        let pages: usize = batch.iter().map(|b| b.3).sum();
+        let bytes: usize = batch.iter().map(|b| b.2).sum();
+        if body.len() != 4 * pages + bytes {
+            return Err(Error::Protocol(format!(
+                "physical read reply of {} bytes, expected {}",
+                body.len(),
+                4 * pages + bytes
+            )));
+        }
+        let (stat, mut data) = body.split_at(4 * pages);
+        status.extend(
+            stat.chunks(4)
+                .map(|s| i32::from_le_bytes(s.try_into().unwrap())),
+        );
+        for &(i, off, len, _) in batch {
+            ranges[i].1[off..off + len].copy_from_slice(&data[..len]);
+            data = &data[len..];
+        }
+        Ok(())
+    }
+
+    /// The guest's RAM ranges (not ROM, MMIO or MMIO2), sorted, contiguous ones merged. The end
+    /// of the last one is the max physical address. Never empty.
+    pub fn ram_ranges(&mut self) -> Result<Vec<Range<u64>>> {
+        let (hdr, body) = self.request(MSG_RAM_RANGES, &[])?;
+        if hdr.rc < 0 {
+            return Err(Error::Server {
+                request: "RAM ranges",
+                rc: hdr.rc,
+            });
+        }
+        if body.is_empty() || body.len() % RANGE_SIZE != 0 {
+            return Err(Error::Protocol(format!(
+                "RAM ranges reply of {} bytes",
+                body.len()
+            )));
+        }
+        body.chunks(RANGE_SIZE)
+            .map(|r| {
+                let first = u64::from_le_bytes(r[0..8].try_into().unwrap());
+                let last = u64::from_le_bytes(r[8..16].try_into().unwrap());
+                // An end-exclusive Range can't hold a range ending at u64::MAX.
+                match last.checked_add(1) {
+                    Some(end) if first <= last => Ok(first..end),
+                    _ => Err(Error::Protocol(format!(
+                        "RAM range {:#x}-{:#x}",
+                        first, last
+                    ))),
+                }
+            })
+            .collect()
     }
 
     /// Sends a request and waits for its reply. Returns the reply header and body (valid until
