@@ -29,6 +29,7 @@ const MSG_RESUME: u16 = 5;
 const MSG_VCPU_COUNT: u16 = 6;
 const MSG_REGS_READ: u16 = 7;
 const MSG_REGS_WRITE: u16 = 8;
+const MSG_PHYS_WRITE: u16 = 9;
 /// Guest page size: physical reads have a status per guest page.
 pub const PAGE_SIZE: u64 = 4096;
 /// `VMIPHYSRANGE` and `VMIRAMRANGE` size.
@@ -459,6 +460,99 @@ impl Client {
         Ok(())
     }
 
+    /// Writes each `(address, bytes)` pair to guest physical RAM. Requests are split to fit the
+    /// wire limit. Appends a VirtualBox status per overlapped guest page, in range order; a
+    /// negative page status (including MMIO or unmapped memory) does not fail the request.
+    /// If a later request fails, statuses from completed requests are retained.
+    pub fn write_physical(&mut self, ranges: &[(u64, &[u8])], status: &mut Vec<i32>) -> Result<()> {
+        for (addr, data) in ranges.iter() {
+            if !data.is_empty() && addr.checked_add(data.len() as u64 - 1).is_none() {
+                return Err(Error::Protocol(format!(
+                    "range of {} bytes at {:#x} wraps around",
+                    data.len(),
+                    addr
+                )));
+            }
+        }
+
+        // Per wire range: input index, offset, length and overlapped guest pages.
+        let mut batch: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut request_size = 4; // cRanges precedes the descriptors and data.
+        let mut reply_size = 0;
+        for (i, &(addr, data)) in ranges.iter().enumerate() {
+            let mut off = 0;
+            while off < data.len() {
+                let page_len =
+                    (data.len() - off).min((PAGE_SIZE - (addr + off as u64) % PAGE_SIZE) as usize);
+                let mut can_merge =
+                    matches!(batch.last(), Some(&(j, o, l, _)) if j == i && o + l == off);
+                let cost = page_len + if can_merge { 0 } else { RANGE_SIZE };
+                if request_size + cost > BODY_SIZE_MAX || reply_size + 4 > BODY_SIZE_MAX {
+                    self.write_batch(ranges, &batch, request_size, status)?;
+                    batch.clear();
+                    request_size = 4;
+                    reply_size = 0;
+                    can_merge = false;
+                }
+                if can_merge {
+                    let (_, _, length, pages) = batch.last_mut().unwrap();
+                    *length += page_len;
+                    *pages += 1;
+                    request_size += page_len;
+                } else {
+                    batch.push((i, off, page_len, 1));
+                    request_size += RANGE_SIZE + page_len;
+                }
+                reply_size += 4;
+                off += page_len;
+            }
+        }
+        if !batch.is_empty() {
+            self.write_batch(ranges, &batch, request_size, status)?;
+        }
+        Ok(())
+    }
+
+    /// Sends one `VMI_MSG_PHYS_WRITE` for `batch` (see `write_physical`).
+    fn write_batch(
+        &mut self,
+        ranges: &[(u64, &[u8])],
+        batch: &[(usize, usize, usize, usize)],
+        request_size: usize,
+        status: &mut Vec<i32>,
+    ) -> Result<()> {
+        let mut req = Vec::with_capacity(request_size);
+        req.extend_from_slice(&(batch.len() as u32).to_le_bytes());
+        for &(i, off, len, _) in batch {
+            req.extend_from_slice(&(ranges[i].0 + off as u64).to_le_bytes());
+            req.extend_from_slice(&(len as u32).to_le_bytes());
+            req.extend_from_slice(&0u32.to_le_bytes());
+        }
+        for &(i, off, len, _) in batch {
+            req.extend_from_slice(&ranges[i].1[off..off + len]);
+        }
+        let (hdr, body) = self.request(MSG_PHYS_WRITE, &req)?;
+        if hdr.rc < 0 {
+            return Err(Error::Server {
+                request: "physical write",
+                rc: hdr.rc,
+            });
+        }
+        let expected = batch.iter().map(|b| b.3).sum::<usize>() * 4;
+        if body.len() != expected {
+            return Err(Error::Protocol(format!(
+                "physical write reply of {} bytes, expected {}",
+                body.len(),
+                expected
+            )));
+        }
+        status.extend(
+            body.chunks(4)
+                .map(|s| i32::from_le_bytes(s.try_into().unwrap())),
+        );
+        Ok(())
+    }
+
     /// The guest's RAM ranges (not ROM, MMIO or MMIO2), sorted, contiguous ones merged. The end
     /// of the last one is the max physical address. Never empty.
     pub fn ram_ranges(&mut self) -> Result<Vec<Range<u64>>> {
@@ -804,5 +898,204 @@ mod tests {
         assert_eq!(&b[384..392], &[0xff, 0x0f, 0, 0, 0, 0, 0, 0]);
         assert_eq!(X86Registers::decode(&b).unwrap(), regs);
         assert!(X86Registers::decode(&b[1..]).is_err());
+    }
+
+    fn write_test_pair() -> (Client, OwnedFd) {
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        (
+            Client {
+                fd: unsafe { OwnedFd::from_raw_fd(fds[0]) },
+                next_id: 1,
+                buf: vec![0; MSG_SIZE_MAX],
+            },
+            unsafe { OwnedFd::from_raw_fd(fds[1]) },
+        )
+    }
+
+    fn write_test_request(fd: &OwnedFd) -> (Header, Vec<u8>) {
+        let mut packet = vec![0; MSG_SIZE_MAX];
+        let n = unsafe { libc::recv(fd.as_raw_fd(), packet.as_mut_ptr().cast(), packet.len(), 0) };
+        assert!(n >= HDR_SIZE as isize);
+        packet.truncate(n as usize);
+        let hdr = Header::decode(&packet);
+        assert_eq!(hdr.size as usize, packet.len());
+        assert_eq!(hdr.kind, MSG_PHYS_WRITE);
+        assert_eq!(hdr.flags, 0);
+        (hdr, packet[HDR_SIZE..].to_vec())
+    }
+
+    fn write_test_reply(fd: &OwnedFd, request: Header, rc: i32, statuses: &[i32]) {
+        let mut packet = Header {
+            size: (HDR_SIZE + statuses.len() * 4) as u32,
+            id: request.id,
+            kind: request.kind,
+            flags: MSG_F_REPLY,
+            rc,
+        }
+        .encode()
+        .to_vec();
+        for s in statuses {
+            packet.extend_from_slice(&s.to_le_bytes());
+        }
+        assert_eq!(
+            unsafe {
+                libc::send(
+                    fd.as_raw_fd(),
+                    packet.as_ptr().cast(),
+                    packet.len(),
+                    libc::MSG_NOSIGNAL,
+                )
+            },
+            packet.len() as isize
+        );
+    }
+
+    #[test]
+    fn write_physical_descriptors_precede_contiguous_data_and_status_is_per_page() {
+        let (mut client, server) = write_test_pair();
+        let worker = std::thread::spawn(move || {
+            let (hdr, body) = write_test_request(&server);
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&2u32.to_le_bytes());
+            expected.extend_from_slice(&0xfffu64.to_le_bytes());
+            expected.extend_from_slice(&2u32.to_le_bytes());
+            expected.extend_from_slice(&0u32.to_le_bytes());
+            expected.extend_from_slice(&0x9000u64.to_le_bytes());
+            expected.extend_from_slice(&3u32.to_le_bytes());
+            expected.extend_from_slice(&0u32.to_le_bytes());
+            expected.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
+            assert_eq!(body, expected);
+            write_test_reply(&server, hdr, 0, &[0, -1618, -1605]);
+        });
+        let mut status = vec![77];
+        client
+            .write_physical(
+                &[
+                    (0xfff, &[0xaa, 0xbb][..]),
+                    (0x9000, &[0xcc, 0xdd, 0xee][..]),
+                    (0, &[]),
+                ],
+                &mut status,
+            )
+            .unwrap();
+        assert_eq!(status, [77, 0, -1618, -1605]);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn write_physical_splits_long_range_on_request_limit() {
+        let (mut client, server) = write_test_pair();
+        let data: Vec<u8> = (0..20 * PAGE_SIZE as usize).map(|i| i as u8).collect();
+        let expected = data.clone();
+        let worker = std::thread::spawn(move || {
+            for (start_page, pages) in [(0, 15), (15, 5)] {
+                let (hdr, body) = write_test_request(&server);
+                assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), 1);
+                assert_eq!(
+                    u64::from_le_bytes(body[4..12].try_into().unwrap()),
+                    start_page as u64 * PAGE_SIZE
+                );
+                assert_eq!(
+                    u32::from_le_bytes(body[12..16].try_into().unwrap()),
+                    pages * PAGE_SIZE as u32
+                );
+                assert_eq!(&body[16..20], &[0; 4]);
+                assert_eq!(
+                    &body[20..],
+                    &expected[start_page * PAGE_SIZE as usize
+                        ..(start_page + pages as usize) * PAGE_SIZE as usize]
+                );
+                assert!(hdr.size as usize <= MSG_SIZE_MAX);
+                write_test_reply(&server, hdr, 0, &vec![start_page as i32; pages as usize]);
+            }
+        });
+        let mut status = Vec::new();
+        client.write_physical(&[(0, &data)], &mut status).unwrap();
+        assert_eq!(status, [vec![0; 15], vec![15; 5]].concat());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn write_physical_splits_many_ranges_before_descriptors_exceed_limit() {
+        let (mut client, server) = write_test_pair();
+        let data = [0x5a];
+        let ranges: Vec<_> = (0..4000).map(|i| (i * PAGE_SIZE, &data[..])).collect();
+        let worker = std::thread::spawn(move || {
+            for (first, count) in [(0, 3853), (3853, 147)] {
+                let (hdr, body) = write_test_request(&server);
+                assert_eq!(hdr.size as usize, HDR_SIZE + 4 + count * (RANGE_SIZE + 1));
+                assert_eq!(
+                    u32::from_le_bytes(body[0..4].try_into().unwrap()),
+                    count as u32
+                );
+                for j in 0..count {
+                    let descriptor = &body[4 + j * RANGE_SIZE..4 + (j + 1) * RANGE_SIZE];
+                    assert_eq!(
+                        u64::from_le_bytes(descriptor[0..8].try_into().unwrap()),
+                        (first + j) as u64 * PAGE_SIZE
+                    );
+                    assert_eq!(&descriptor[8..16], &[1, 0, 0, 0, 0, 0, 0, 0]);
+                }
+                assert_eq!(&body[4 + count * RANGE_SIZE..], vec![0x5a; count]);
+                write_test_reply(&server, hdr, 0, &vec![0; count]);
+            }
+        });
+        let mut status = Vec::new();
+        client.write_physical(&ranges, &mut status).unwrap();
+        assert_eq!(status, vec![0; 4000]);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn write_physical_rejects_wrapping_range_without_sending() {
+        let (mut client, _server) = write_test_pair();
+        let mut status = vec![9];
+        let result = client.write_physical(&[(0, &[1]), (u64::MAX, &[2, 3])], &mut status);
+        assert!(matches!(result, Err(Error::Protocol(_))));
+        assert_eq!(client.next_id, 1);
+        assert_eq!(status, [9]);
+    }
+
+    #[test]
+    fn write_physical_checks_reply_length_and_retains_completed_statuses() {
+        let (mut client, server) = write_test_pair();
+        let data = vec![0x42; 20 * PAGE_SIZE as usize];
+        let worker = std::thread::spawn(move || {
+            let (first, _) = write_test_request(&server);
+            write_test_reply(&server, first, 0, &[0; 15]);
+            let (second, _) = write_test_request(&server);
+            write_test_reply(&server, second, 0, &[0; 4]);
+            let (third, _) = write_test_request(&server);
+            write_test_reply(&server, third, VERR_INVALID_PARAMETER, &[]);
+        });
+        let mut status = vec![7];
+        let err = client
+            .write_physical(&[(0, &data)], &mut status)
+            .unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)));
+        assert_eq!(status, [vec![7], vec![0; 15]].concat());
+        let err = client
+            .write_physical(&[(0, &[1])], &mut status)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Server {
+                request: "physical write",
+                rc: VERR_INVALID_PARAMETER
+            }
+        ));
+        assert_eq!(status, [vec![7], vec![0; 15]].concat());
+        worker.join().unwrap();
     }
 }
