@@ -24,6 +24,9 @@ const BODY_SIZE_MAX: usize = MSG_SIZE_MAX - HDR_SIZE;
 const MSG_HELLO: u16 = 1;
 const MSG_PHYS_READ: u16 = 2;
 const MSG_RAM_RANGES: u16 = 3;
+const MSG_PAUSE: u16 = 4;
+const MSG_RESUME: u16 = 5;
+const MSG_VCPU_COUNT: u16 = 6;
 /// Guest page size: physical reads have a status per guest page.
 pub const PAGE_SIZE: u64 = 4096;
 /// `VMIPHYSRANGE` and `VMIRAMRANGE` size.
@@ -35,6 +38,7 @@ const VERR_INVALID_MAGIC: i32 = -3;
 const VERR_VERSION_MISMATCH: i32 = -11;
 const VERR_ACCESS_DENIED: i32 = -38;
 const VERR_RESOURCE_BUSY: i32 = -138;
+const VERR_VM_INVALID_VM_STATE: i32 = -1907;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -54,6 +58,8 @@ pub enum Error {
     Protocol(String),
     #[error("VBoxVMI {request} failed with VirtualBox status {rc}")]
     Server { request: &'static str, rc: i32 },
+    #[error("VBoxVMI {request} refused: the VM is neither running nor paused (powering on or off, saving, snapshot, teleporting), or was paused by the host's power management")]
+    VmState { request: &'static str },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -304,6 +310,48 @@ impl Client {
                 }
             })
             .collect()
+    }
+
+    /// Pauses the VM (`VMI_MSG_PAUSE`) with VirtualBox's standard pause: the VM shows as `Paused`
+    /// to other API clients (e.g. `VBoxManage showvminfo`). Returns once every vCPU has stopped.
+    /// A no-op if the VM is paused already. Not counted: a single [`Client::resume`] resumes the
+    /// VM however many times it was paused, by anyone.
+    pub fn pause(&mut self) -> Result<()> {
+        self.pause_or_resume(MSG_PAUSE, "pause")
+    }
+
+    /// Resumes the VM (`VMI_MSG_RESUME`); a no-op if it is running already.
+    pub fn resume(&mut self) -> Result<()> {
+        self.pause_or_resume(MSG_RESUME, "resume")
+    }
+
+    fn pause_or_resume(&mut self, kind: u16, request: &'static str) -> Result<()> {
+        let (hdr, body) = self.request(kind, &[])?;
+        match hdr.rc {
+            VERR_VM_INVALID_VM_STATE => Err(Error::VmState { request }),
+            rc if rc < 0 => Err(Error::Server { request, rc }),
+            _ if !body.is_empty() => Err(Error::Protocol(format!(
+                "{} reply of {} bytes",
+                request,
+                body.len()
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// The number of vCPUs (`VMI_MSG_VCPU_COUNT`), at least 1 and fixed for the VM's lifetime.
+    pub fn vcpu_count(&mut self) -> Result<u32> {
+        let (hdr, body) = self.request(MSG_VCPU_COUNT, &[])?;
+        if hdr.rc < 0 {
+            return Err(Error::Server {
+                request: "vCPU count",
+                rc: hdr.rc,
+            });
+        }
+        match body.try_into().map(u32::from_le_bytes) {
+            Ok(count) if count > 0 => Ok(count),
+            _ => Err(Error::Protocol(format!("vCPU count reply {:02x?}", body))),
+        }
     }
 
     /// Sends a request and waits for its reply. Returns the reply header and body (valid until
