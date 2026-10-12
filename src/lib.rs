@@ -4,6 +4,7 @@
 //! The wire format is specified in the VirtualBox tree: `doc/technical/VBoxVMI-protocol.md`
 //! and `include/VBox/vmm/vmi.h`. Linux only.
 
+use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::io;
 use std::mem;
@@ -11,11 +12,12 @@ use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Protocol magic, the bytes "BVMI" on the wire.
 pub const MAGIC: u32 = 0x494d_5642;
 /// Protocol version spoken by this crate. Client and server must match exactly.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Maximum size of a message, header included.
 const MSG_SIZE_MAX: usize = 64 * 1024;
@@ -30,6 +32,14 @@ const MSG_VCPU_COUNT: u16 = 6;
 const MSG_REGS_READ: u16 = 7;
 const MSG_REGS_WRITE: u16 = 8;
 const MSG_PHYS_WRITE: u16 = 9;
+const MSG_INTERCEPT_SET: u16 = 0x0a;
+const MSG_INTERCEPT_CLEAR: u16 = 0x0b;
+const MSG_EVENT_REPLY: u16 = 0x0c;
+/// `VMIINTERCEPT` and `VMIEVENT` kinds.
+const INTERCEPT_BREAKPOINT: u32 = 1;
+const INTERCEPT_SINGLESTEP: u32 = 2;
+const EVENT_REPLY_F_REINJECT: u32 = 1;
+const MSG_EVENT: u16 = 0x0d;
 /// Guest page size: physical reads have a status per guest page.
 pub const PAGE_SIZE: u64 = 4096;
 /// `VMIPHYSRANGE` and `VMIRAMRANGE` size.
@@ -40,9 +50,12 @@ const MSG_F_REPLY: u16 = 1;
 const VERR_INVALID_PARAMETER: i32 = -2;
 const VERR_INVALID_MAGIC: i32 = -3;
 const VERR_VERSION_MISMATCH: i32 = -11;
+const VERR_NOT_SUPPORTED: i32 = -37;
 const VERR_ACCESS_DENIED: i32 = -38;
+const VERR_INVALID_STATE: i32 = -79;
 const VERR_RESOURCE_BUSY: i32 = -138;
 const VERR_INVALID_CPU_ID: i32 = -1018;
+const VERR_DBGF_ALREADY_ATTACHED: i32 = -1201;
 const VERR_VM_INVALID_VM_STATE: i32 = -1907;
 
 #[derive(thiserror::Error, Debug)]
@@ -69,6 +82,43 @@ pub enum Error {
     NoSuchVcpu(u32),
     #[error("VBoxVMI register write refused (VERR_INVALID_PARAMETER): a value the CPU would not load (RFLAGS, control register, EFER or MSR), or a nonzero reserved field; nothing was written")]
     InvalidRegisters,
+    #[error(
+        "VBoxVMI intercept refused: the VirtualBox debugger is attached to the VM; detach it first"
+    )]
+    DebuggerAttached,
+    #[error("VBoxVMI event reply refused: vCPU {0} is not waiting for a reply")]
+    NotParked(u32),
+    #[error("VBoxVMI event reply refused (VERR_INVALID_PARAMETER): only a breakpoint event can be reinjected; the vCPU stays parked")]
+    InvalidReply,
+    #[error("VBoxVMI {request} is not supported on this VM (single step needs VT-x with the monitor trap flag)")]
+    NotSupported { request: &'static str },
+}
+
+/// What an Intercept stops a vCPU on (`VMIINTERCEPT` kind).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterceptKind {
+    /// An `int3` instruction the vCPU executes.
+    Breakpoint,
+    /// Every instruction boundary of the vCPU.
+    Singlestep,
+}
+
+/// A VMI event (`VMIEVENT`) received from the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Event {
+    /// The vCPU parked at this event.
+    pub vcpu: u32,
+    pub kind: EventKind,
+}
+
+/// Why the vCPU parked. Only the matching vCPU waits for the reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    /// The `int3` at `gpa` was intercepted; RIP still points to it. Reinjection delivers #BP.
+    Breakpoint { gpa: u64, insn_len: u32 },
+    /// At the next instruction boundary; `gpa` is the physical address at RIP, `u64::MAX` if RIP
+    /// is not mapped (a step onto a page the guest has not faulted in yet).
+    Singlestep { gpa: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -298,6 +348,7 @@ pub struct Client {
     next_id: u32,
     /// Receive buffer, reused for every message.
     buf: Vec<u8>,
+    events: VecDeque<Event>,
 }
 
 impl Client {
@@ -308,14 +359,20 @@ impl Client {
             path: path.to_path_buf(),
             source,
         })?;
+        Client::handshake(fd)
+    }
+
+    /// Performs the handshake on a connected socket.
+    fn handshake(fd: OwnedFd) -> Result<Self> {
         let mut client = Client {
             fd,
             next_id: 1,
             buf: vec![0; MSG_SIZE_MAX],
+            events: VecDeque::new(),
         };
 
         // The server speaks first: it tells a refused client why.
-        let (hdr, body) = client.recv()?;
+        let hdr = client.recv()?;
         if hdr.kind != MSG_HELLO || hdr.flags != 0 || hdr.id != 0 {
             return Err(Error::Protocol(format!("unexpected greeting {:?}", hdr)));
         }
@@ -330,11 +387,9 @@ impl Client {
             }
             _ => {}
         }
-        check_hello(body)?;
+        check_hello(client.body(hdr))?;
 
-        let mut req = [0u8; 8];
-        req[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        req[4..8].copy_from_slice(&VERSION.to_le_bytes());
+        let req = u32_pair(MAGIC, VERSION);
         let (hdr, body) = client.request(MSG_HELLO, &req)?;
         match hdr.rc {
             VERR_VERSION_MISMATCH => {
@@ -630,7 +685,7 @@ impl Client {
     /// Reads the registers of vCPU `vcpu` (`VMI_MSG_REGS_READ`), in one request. Served between
     /// two instructions of that vCPU: a consistent snapshot of it, also while the VM runs.
     pub fn read_registers(&mut self, vcpu: u32) -> Result<X86Registers> {
-        let req = vcpu_request(vcpu);
+        let req = u32_pair(vcpu, 0);
         let (hdr, body) = self.request(MSG_REGS_READ, &req)?;
         match hdr.rc {
             VERR_INVALID_CPU_ID => Err(Error::NoSuchVcpu(vcpu)),
@@ -650,7 +705,7 @@ impl Client {
     /// table load, the attributes are kept. Refused unless the VM is running or paused.
     pub fn write_registers(&mut self, vcpu: u32, regs: &X86Registers) -> Result<()> {
         let mut req = [0u8; 8 + REGS_SIZE];
-        req[..8].copy_from_slice(&vcpu_request(vcpu));
+        req[..8].copy_from_slice(&u32_pair(vcpu, 0));
         req[8..].copy_from_slice(&regs.encode());
         let request = "register write";
         let (hdr, body) = self.request(MSG_REGS_WRITE, &req)?;
@@ -668,6 +723,124 @@ impl Client {
         }
     }
 
+    /// Sets an Intercept of `kind` on vCPU `vcpu` (`VMI_MSG_INTERCEPT_SET`): the vCPU then raises
+    /// an [`Event`] and parks until [`Client::reply_event`]. Idempotent; allowed while the VM runs
+    /// or is paused, also while handling an event. Refused with [`Error::DebuggerAttached`] while
+    /// the VirtualBox debugger is attached.
+    pub fn set_intercept(&mut self, vcpu: u32, kind: InterceptKind) -> Result<()> {
+        self.intercept(MSG_INTERCEPT_SET, vcpu, kind)
+    }
+
+    /// Clears an Intercept of `kind` on vCPU `vcpu` (`VMI_MSG_INTERCEPT_CLEAR`). Idempotent.
+    pub fn clear_intercept(&mut self, vcpu: u32, kind: InterceptKind) -> Result<()> {
+        self.intercept(MSG_INTERCEPT_CLEAR, vcpu, kind)
+    }
+
+    fn intercept(&mut self, msg: u16, vcpu: u32, kind: InterceptKind) -> Result<()> {
+        let (code, request) = match kind {
+            InterceptKind::Breakpoint => (INTERCEPT_BREAKPOINT, "breakpoint intercept"),
+            InterceptKind::Singlestep => (INTERCEPT_SINGLESTEP, "single-step intercept"),
+        };
+        let (hdr, body) = self.request(msg, &u32_pair(vcpu, code))?;
+        match hdr.rc {
+            VERR_INVALID_CPU_ID => Err(Error::NoSuchVcpu(vcpu)),
+            VERR_DBGF_ALREADY_ATTACHED => Err(Error::DebuggerAttached),
+            VERR_NOT_SUPPORTED => Err(Error::NotSupported { request }),
+            rc if rc < 0 => Err(Error::Server { request, rc }),
+            _ if !body.is_empty() => Err(Error::Protocol(format!(
+                "{} reply of {} bytes",
+                request,
+                body.len()
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Releases the parked vCPU `vcpu` after its event (`VMI_MSG_EVENT_REPLY`). Without
+    /// `reinject` it continues at its RIP; with it the guest gets the #BP of a breakpoint event as
+    /// if it had not been intercepted ([`Error::InvalidReply`] for another event). A reply while
+    /// the VM is paused succeeds; the vCPU continues once the VM is resumed.
+    pub fn reply_event(&mut self, vcpu: u32, reinject: bool) -> Result<()> {
+        let flags = if reinject { EVENT_REPLY_F_REINJECT } else { 0 };
+        let request = "event reply";
+        let (hdr, body) = self.request(MSG_EVENT_REPLY, &u32_pair(vcpu, flags))?;
+        match hdr.rc {
+            VERR_INVALID_CPU_ID => Err(Error::NoSuchVcpu(vcpu)),
+            VERR_INVALID_STATE => Err(Error::NotParked(vcpu)),
+            VERR_INVALID_PARAMETER => Err(Error::InvalidReply),
+            rc if rc < 0 => Err(Error::Server { request, rc }),
+            _ if !body.is_empty() => Err(Error::Protocol(format!(
+                "{} reply of {} bytes",
+                request,
+                body.len()
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Returns the oldest pending [`Event`], or `None` after `timeout` elapsed. A zero timeout
+    /// polls without waiting. Events received while requests await replies are queued in order.
+    pub fn wait_event(&mut self, timeout: Duration) -> Result<Option<Event>> {
+        if let Some(event) = self.events.pop_front() {
+            return Ok(Some(event));
+        }
+        let deadline = Instant::now().checked_add(timeout);
+        loop {
+            let remaining = deadline.map(|end| end.saturating_duration_since(Instant::now()));
+            let ms = match remaining {
+                Some(duration) => duration
+                    .as_millis()
+                    .saturating_add(u128::from(duration.subsec_nanos() % 1_000_000 != 0)),
+                None => i32::MAX as u128,
+            };
+            let mut fds = libc::pollfd {
+                fd: self.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut fds, 1, ms.min(i32::MAX as u128) as i32) };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err.into());
+            }
+            if rc == 0 {
+                if deadline.is_some_and(|end| Instant::now() >= end) {
+                    return Ok(None);
+                }
+                continue;
+            }
+            let hdr = self.recv()?;
+            return Ok(Some(self.decode_event(hdr)?));
+        }
+    }
+
+    /// Decodes a server-to-client `VMIEVENT`; rejects replies or malformed events.
+    fn decode_event(&self, hdr: Header) -> Result<Event> {
+        if hdr.kind != MSG_EVENT || hdr.id != 0 || hdr.flags != 0 || hdr.rc != 0 {
+            return Err(Error::Protocol(format!("unexpected event {:?}", hdr)));
+        }
+        let body = self.body(hdr);
+        if body.len() != 24 {
+            return Err(Error::Protocol(format!(
+                "event body of {} bytes",
+                body.len()
+            )));
+        }
+        let vcpu = u32::from_le_bytes(body[0..4].try_into().unwrap());
+        let kind = u32::from_le_bytes(body[4..8].try_into().unwrap());
+        let gpa = u64::from_le_bytes(body[8..16].try_into().unwrap());
+        let insn_len = u32::from_le_bytes(body[16..20].try_into().unwrap());
+        let reserved = u32::from_le_bytes(body[20..24].try_into().unwrap());
+        let kind = match (kind, insn_len, reserved) {
+            (INTERCEPT_BREAKPOINT, len, 0) => EventKind::Breakpoint { gpa, insn_len: len },
+            (INTERCEPT_SINGLESTEP, 0, 0) => EventKind::Singlestep { gpa },
+            _ => return Err(Error::Protocol(format!("invalid event body {:02x?}", body))),
+        };
+        Ok(Event { vcpu, kind })
+    }
     /// Sends a request and waits for its reply. Returns the reply header and body (valid until
     /// the next message); the caller checks the status.
     fn request(&mut self, kind: u16, body: &[u8]) -> Result<(Header, &[u8])> {
@@ -714,18 +887,25 @@ impl Client {
             }
         }
 
-        let (reply, body) = self.recv()?;
-        if reply.flags != MSG_F_REPLY || reply.id != id || reply.kind != kind {
-            return Err(Error::Protocol(format!(
-                "unexpected reply {:?} to request {} type {}",
-                reply, id, kind
-            )));
+        loop {
+            let reply = self.recv()?;
+            if reply.kind == MSG_EVENT {
+                let event = self.decode_event(reply)?;
+                self.events.push_back(event);
+                continue;
+            }
+            if reply.flags != MSG_F_REPLY || reply.id != id || reply.kind != kind {
+                return Err(Error::Protocol(format!(
+                    "unexpected reply {:?} to request {} type {}",
+                    reply, id, kind
+                )));
+            }
+            return Ok((reply, self.body(reply)));
         }
-        Ok((reply, body))
     }
 
     /// Receives one message into the reusable buffer.
-    fn recv(&mut self) -> Result<(Header, &[u8])> {
+    fn recv(&mut self) -> Result<Header> {
         let n = loop {
             // MSG_TRUNC returns the real size of an oversized message.
             let n = unsafe {
@@ -757,15 +937,21 @@ impl Client {
                 hdr.size, n
             )));
         }
-        Ok((hdr, &self.buf[HDR_SIZE..n]))
+        Ok(hdr)
+    }
+
+    fn body(&self, hdr: Header) -> &[u8] {
+        &self.buf[HDR_SIZE..hdr.size as usize]
     }
 }
 
-/// `VMIVCPUREQ` body.
-fn vcpu_request(vcpu: u32) -> [u8; 8] {
-    let mut req = [0u8; 8];
-    req[0..4].copy_from_slice(&vcpu.to_le_bytes());
-    req
+/// An 8-byte body of two `u32`: `VMIHELLO`, `VMIVCPUREQ` (vCPU, reserved 0), `VMIINTERCEPT`,
+/// `VMIEVENTREPLY`.
+fn u32_pair(first: u32, second: u32) -> [u8; 8] {
+    let mut b = [0u8; 8];
+    b[0..4].copy_from_slice(&first.to_le_bytes());
+    b[4..8].copy_from_slice(&second.to_le_bytes());
+    b
 }
 
 fn check_hello(body: &[u8]) -> Result<()> {
@@ -918,36 +1104,41 @@ mod tests {
                 fd: unsafe { OwnedFd::from_raw_fd(fds[0]) },
                 next_id: 1,
                 buf: vec![0; MSG_SIZE_MAX],
+                events: VecDeque::new(),
             },
             unsafe { OwnedFd::from_raw_fd(fds[1]) },
         )
     }
 
     fn write_test_request(fd: &OwnedFd) -> (Header, Vec<u8>) {
+        test_request(fd, MSG_PHYS_WRITE)
+    }
+
+    /// Receives one request of type `kind` on the fake server side.
+    fn test_request(fd: &OwnedFd, kind: u16) -> (Header, Vec<u8>) {
         let mut packet = vec![0; MSG_SIZE_MAX];
         let n = unsafe { libc::recv(fd.as_raw_fd(), packet.as_mut_ptr().cast(), packet.len(), 0) };
         assert!(n >= HDR_SIZE as isize);
         packet.truncate(n as usize);
         let hdr = Header::decode(&packet);
         assert_eq!(hdr.size as usize, packet.len());
-        assert_eq!(hdr.kind, MSG_PHYS_WRITE);
+        assert_eq!(hdr.kind, kind);
         assert_eq!(hdr.flags, 0);
         (hdr, packet[HDR_SIZE..].to_vec())
     }
 
-    fn write_test_reply(fd: &OwnedFd, request: Header, rc: i32, statuses: &[i32]) {
+    /// Sends one message from the fake server side.
+    fn test_send(fd: &OwnedFd, id: u32, kind: u16, flags: u16, rc: i32, body: &[u8]) {
         let mut packet = Header {
-            size: (HDR_SIZE + statuses.len() * 4) as u32,
-            id: request.id,
-            kind: request.kind,
-            flags: MSG_F_REPLY,
+            size: (HDR_SIZE + body.len()) as u32,
+            id,
+            kind,
+            flags,
             rc,
         }
         .encode()
         .to_vec();
-        for s in statuses {
-            packet.extend_from_slice(&s.to_le_bytes());
-        }
+        packet.extend_from_slice(body);
         assert_eq!(
             unsafe {
                 libc::send(
@@ -959,6 +1150,209 @@ mod tests {
             },
             packet.len() as isize
         );
+    }
+
+    fn write_test_reply(fd: &OwnedFd, request: Header, rc: i32, statuses: &[i32]) {
+        let body: Vec<u8> = statuses.iter().flat_map(|s| s.to_le_bytes()).collect();
+        test_send(fd, request.id, request.kind, MSG_F_REPLY, rc, &body);
+    }
+
+    #[test]
+    fn version_1_greeting_is_refused() {
+        let (client, server) = write_test_pair();
+        let worker = std::thread::spawn(move || {
+            test_send(&server, 0, MSG_HELLO, 0, 0, &u32_pair(MAGIC, 1));
+            server
+        });
+        let err = Client::handshake(client.fd).err().unwrap();
+        assert!(matches!(
+            err,
+            Error::VersionMismatch {
+                server: 1,
+                client: 2
+            }
+        ));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn intercept_and_event_reply_layout_matches_contract() {
+        let (mut client, server) = write_test_pair();
+        let worker = std::thread::spawn(move || {
+            // VMI_MSG_INTERCEPT_SET, _CLEAR, VMI_MSG_EVENT_REPLY; (idCpu, uKind / fFlags).
+            for (kind, body) in [
+                (0x0a, [3, 0, 0, 0, 1, 0, 0, 0]),
+                (0x0b, [3, 0, 0, 0, 2, 0, 0, 0]),
+                (0x0c, [1, 0, 0, 0, 1, 0, 0, 0]),
+                (0x0c, [1, 0, 0, 0, 0, 0, 0, 0]),
+            ] {
+                let (hdr, got) = test_request(&server, kind);
+                assert_eq!(got, body);
+                write_test_reply(&server, hdr, 0, &[]);
+            }
+        });
+        client.set_intercept(3, InterceptKind::Breakpoint).unwrap();
+        client
+            .clear_intercept(3, InterceptKind::Singlestep)
+            .unwrap();
+        client.reply_event(1, true).unwrap();
+        client.reply_event(1, false).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn intercept_and_event_reply_errors_map_to_variants() {
+        let (mut client, server) = write_test_pair();
+        let worker = std::thread::spawn(move || {
+            for (kind, rc) in [
+                (0x0a, -1201),
+                (0x0a, -37),
+                (0x0a, -1018),
+                (0x0b, -1018),
+                (0x0c, -79),
+                (0x0c, -2),
+                (0x0c, -1018),
+                (0x0c, -5),
+            ] {
+                let (hdr, _) = test_request(&server, kind);
+                write_test_reply(&server, hdr, rc, &[]);
+            }
+        });
+        use InterceptKind::*;
+        assert!(matches!(
+            client.set_intercept(0, Breakpoint),
+            Err(Error::DebuggerAttached)
+        ));
+        assert!(matches!(
+            client.set_intercept(0, Singlestep),
+            Err(Error::NotSupported {
+                request: "single-step intercept"
+            })
+        ));
+        assert!(matches!(
+            client.set_intercept(7, Breakpoint),
+            Err(Error::NoSuchVcpu(7))
+        ));
+        assert!(matches!(
+            client.clear_intercept(8, Breakpoint),
+            Err(Error::NoSuchVcpu(8))
+        ));
+        assert!(matches!(
+            client.reply_event(2, false),
+            Err(Error::NotParked(2))
+        ));
+        assert!(matches!(
+            client.reply_event(2, true),
+            Err(Error::InvalidReply)
+        ));
+        assert!(matches!(
+            client.reply_event(9, false),
+            Err(Error::NoSuchVcpu(9))
+        ));
+        assert!(matches!(
+            client.reply_event(2, false),
+            Err(Error::Server {
+                request: "event reply",
+                rc: -5
+            })
+        ));
+        worker.join().unwrap();
+    }
+
+    /// A `VMIEVENT` body at the contract's offsets.
+    fn event_body(vcpu: u32, kind: u32, gpa: u64, insn_len: u32) -> [u8; 24] {
+        let mut b = [0xffu8; 24];
+        b[0..4].copy_from_slice(&vcpu.to_le_bytes());
+        b[4..8].copy_from_slice(&kind.to_le_bytes());
+        b[8..16].copy_from_slice(&gpa.to_le_bytes());
+        b[16..20].copy_from_slice(&insn_len.to_le_bytes());
+        b[20..24].copy_from_slice(&0u32.to_le_bytes());
+        b
+    }
+
+    fn send_event(fd: &OwnedFd, vcpu: u32, kind: u32, gpa: u64, insn_len: u32) {
+        test_send(fd, 0, 0x0d, 0, 0, &event_body(vcpu, kind, gpa, insn_len));
+    }
+
+    #[test]
+    fn events_received_with_replies_are_queued_then_waited_for_in_order() {
+        let (mut client, server) = write_test_pair();
+        let worker = std::thread::spawn(move || {
+            let (hdr, _) = test_request(&server, 0x0a);
+            send_event(&server, 0, 1, 0x1_2345_6789, 1);
+            send_event(&server, 1, 2, 0xfedc_ba98_7654_3210, 0);
+            write_test_reply(&server, hdr, 0, &[]);
+            let (hdr, _) = test_request(&server, MSG_VCPU_COUNT);
+            send_event(&server, 2, 1, 0x4000, 3);
+            write_test_reply(&server, hdr, 0, &[3]);
+            std::thread::sleep(Duration::from_millis(50));
+            send_event(&server, 0, 2, 0x5000, 0);
+            server
+        });
+        client.set_intercept(0, InterceptKind::Breakpoint).unwrap();
+        assert_eq!(client.vcpu_count().unwrap(), 3);
+        let event = |vcpu, kind| Some(Event { vcpu, kind });
+        assert_eq!(
+            client.wait_event(Duration::ZERO).unwrap(),
+            event(
+                0,
+                EventKind::Breakpoint {
+                    gpa: 0x1_2345_6789,
+                    insn_len: 1
+                }
+            )
+        );
+        assert_eq!(
+            client.wait_event(Duration::ZERO).unwrap(),
+            event(
+                1,
+                EventKind::Singlestep {
+                    gpa: 0xfedc_ba98_7654_3210
+                }
+            )
+        );
+        assert_eq!(
+            client.wait_event(Duration::ZERO).unwrap(),
+            event(
+                2,
+                EventKind::Breakpoint {
+                    gpa: 0x4000,
+                    insn_len: 3
+                }
+            )
+        );
+        assert_eq!(
+            client.wait_event(Duration::from_secs(10)).unwrap(),
+            event(0, EventKind::Singlestep { gpa: 0x5000 })
+        );
+        let _server = worker.join().unwrap();
+        assert_eq!(client.wait_event(Duration::ZERO).unwrap(), None);
+    }
+
+    #[test]
+    fn wait_event_times_out_with_none() {
+        let (mut client, _server) = write_test_pair();
+        let start = std::time::Instant::now();
+        assert_eq!(client.wait_event(Duration::from_millis(50)).unwrap(), None);
+        assert!(start.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn messages_other_than_replies_and_events_are_protocol_errors() {
+        let (mut client, server) = write_test_pair();
+        let worker = std::thread::spawn(move || {
+            let (hdr, _) = test_request(&server, MSG_VCPU_COUNT);
+            // An event must have idReq 0.
+            test_send(&server, hdr.id, 0x0d, 0, 0, &event_body(0, 1, 0, 1));
+            test_send(&server, 9, MSG_PAUSE, MSG_F_REPLY, 0, &[]);
+            server
+        });
+        assert!(matches!(client.vcpu_count(), Err(Error::Protocol(_))));
+        assert!(matches!(
+            client.wait_event(Duration::from_secs(10)),
+            Err(Error::Protocol(_))
+        ));
+        worker.join().unwrap();
     }
 
     #[test]
