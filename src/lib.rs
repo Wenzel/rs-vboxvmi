@@ -58,7 +58,7 @@ pub enum Error {
     Protocol(String),
     #[error("VBoxVMI {request} failed with VirtualBox status {rc}")]
     Server { request: &'static str, rc: i32 },
-    #[error("VBoxVMI {request} refused: the VM is neither running nor paused (powering on or off, saving, snapshot, teleporting), or was paused by the host's power management")]
+    #[error("VBoxVMI {request} refused: VirtualBox controls the VM's run state (powering on or off, saving or restoring state, snapshot, teleport, configuration change, or paused by the host's power management); retry once it settles")]
     VmState { request: &'static str },
 }
 
