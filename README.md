@@ -10,3 +10,4 @@ branch `vmi/vboxvmi` of https://github.com/Wenzel/virtualbox). Linux only.
     cargo run --example handshake -- <VBox user home>/vmi/<vm uuid>.sock
     cargo run --example read -- <VBox user home>/vmi/<vm uuid>.sock 0 fee00000   # RAM ranges, page status
     cargo run --example pause -- <VBox user home>/vmi/<vm uuid>.sock 5           # vCPU count, pause 5 s, resume
+    cargo run --example registers -- <VBox user home>/vmi/<vm uuid>.sock 0       # vCPU 0 registers, written back

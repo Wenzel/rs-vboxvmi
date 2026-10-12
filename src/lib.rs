@@ -27,6 +27,8 @@ const MSG_RAM_RANGES: u16 = 3;
 const MSG_PAUSE: u16 = 4;
 const MSG_RESUME: u16 = 5;
 const MSG_VCPU_COUNT: u16 = 6;
+const MSG_REGS_READ: u16 = 7;
+const MSG_REGS_WRITE: u16 = 8;
 /// Guest page size: physical reads have a status per guest page.
 pub const PAGE_SIZE: u64 = 4096;
 /// `VMIPHYSRANGE` and `VMIRAMRANGE` size.
@@ -34,10 +36,12 @@ const RANGE_SIZE: usize = 16;
 const MSG_F_REPLY: u16 = 1;
 
 // VirtualBox status codes (iprt/err.h) the client tells apart.
+const VERR_INVALID_PARAMETER: i32 = -2;
 const VERR_INVALID_MAGIC: i32 = -3;
 const VERR_VERSION_MISMATCH: i32 = -11;
 const VERR_ACCESS_DENIED: i32 = -38;
 const VERR_RESOURCE_BUSY: i32 = -138;
+const VERR_INVALID_CPU_ID: i32 = -1018;
 const VERR_VM_INVALID_VM_STATE: i32 = -1907;
 
 #[derive(thiserror::Error, Debug)]
@@ -60,6 +64,10 @@ pub enum Error {
     Server { request: &'static str, rc: i32 },
     #[error("VBoxVMI {request} refused: VirtualBox controls the VM's run state (powering on or off, saving or restoring state, snapshot, teleport, configuration change, or paused by the host's power management); retry once it settles")]
     VmState { request: &'static str },
+    #[error("VBoxVMI: the VM has no vCPU {0}")]
+    NoSuchVcpu(u32),
+    #[error("VBoxVMI register write refused (VERR_INVALID_PARAMETER): a value the CPU would not load (RFLAGS, control register, EFER or MSR), or a nonzero reserved field; nothing was written")]
+    InvalidRegisters,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -108,6 +116,177 @@ fn decode_hello(body: &[u8]) -> Result<(u32, u32)> {
         u32::from_le_bytes(body[0..4].try_into().unwrap()),
         u32::from_le_bytes(body[4..8].try_into().unwrap()),
     ))
+}
+
+/// `VMIX86SEG` and `VMIX86DTR` size.
+const SEG_SIZE: usize = 16;
+/// `VMIX86REGS` size.
+const REGS_SIZE: usize = 392;
+
+/// A segment register (`VMIX86SEG`): the selector and its hidden base and limit. The attributes
+/// are not part of the protocol; a write keeps them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Segment {
+    pub base: u64,
+    /// In bytes, the granularity applied.
+    pub limit: u32,
+    pub selector: u16,
+}
+
+/// A descriptor table register, GDTR or IDTR (`VMIX86DTR`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TableRegister {
+    pub base: u64,
+    pub limit: u16,
+}
+
+/// The registers of an x86 vCPU (`VMIX86REGS`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct X86Registers {
+    pub rax: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rbx: u64,
+    pub rsp: u64,
+    pub rbp: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
+    /// The architectural bits.
+    pub rflags: u64,
+    pub cr0: u64,
+    pub cr2: u64,
+    pub cr3: u64,
+    pub cr4: u64,
+    /// MSRs; one the guest CPU doesn't have reads as 0.
+    pub efer: u64,
+    pub star: u64,
+    pub lstar: u64,
+    pub sysenter_cs: u64,
+    pub sysenter_esp: u64,
+    pub sysenter_eip: u64,
+    pub apic_base: u64,
+    pub es: Segment,
+    pub cs: Segment,
+    pub ss: Segment,
+    pub ds: Segment,
+    pub fs: Segment,
+    pub gs: Segment,
+    pub ldtr: Segment,
+    pub tr: Segment,
+    pub gdtr: TableRegister,
+    pub idtr: TableRegister,
+}
+
+impl X86Registers {
+    /// The 64-bit fields in wire order, up to the segments.
+    fn u64_fields(&mut self) -> [&mut u64; 29] {
+        [
+            &mut self.rax,
+            &mut self.rcx,
+            &mut self.rdx,
+            &mut self.rbx,
+            &mut self.rsp,
+            &mut self.rbp,
+            &mut self.rsi,
+            &mut self.rdi,
+            &mut self.r8,
+            &mut self.r9,
+            &mut self.r10,
+            &mut self.r11,
+            &mut self.r12,
+            &mut self.r13,
+            &mut self.r14,
+            &mut self.r15,
+            &mut self.rip,
+            &mut self.rflags,
+            &mut self.cr0,
+            &mut self.cr2,
+            &mut self.cr3,
+            &mut self.cr4,
+            &mut self.efer,
+            &mut self.star,
+            &mut self.lstar,
+            &mut self.sysenter_cs,
+            &mut self.sysenter_esp,
+            &mut self.sysenter_eip,
+            &mut self.apic_base,
+        ]
+    }
+
+    /// The segment registers in wire order.
+    fn segments(&mut self) -> [&mut Segment; 8] {
+        [
+            &mut self.es,
+            &mut self.cs,
+            &mut self.ss,
+            &mut self.ds,
+            &mut self.fs,
+            &mut self.gs,
+            &mut self.ldtr,
+            &mut self.tr,
+        ]
+    }
+
+    fn encode(&self) -> [u8; REGS_SIZE] {
+        // The accessors borrow mutably: encode a copy.
+        let mut regs = self.clone();
+        let mut b = [0u8; REGS_SIZE];
+        let mut off = 0;
+        for v in regs.u64_fields() {
+            b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+            off += 8;
+        }
+        for seg in regs.segments() {
+            b[off..off + 8].copy_from_slice(&seg.base.to_le_bytes());
+            b[off + 8..off + 12].copy_from_slice(&seg.limit.to_le_bytes());
+            b[off + 12..off + 14].copy_from_slice(&seg.selector.to_le_bytes());
+            off += SEG_SIZE;
+        }
+        for dtr in [&regs.gdtr, &regs.idtr] {
+            b[off..off + 8].copy_from_slice(&dtr.base.to_le_bytes());
+            b[off + 8..off + 10].copy_from_slice(&dtr.limit.to_le_bytes());
+            off += SEG_SIZE;
+        }
+        debug_assert_eq!(off, REGS_SIZE);
+        b
+    }
+
+    fn decode(b: &[u8]) -> Result<Self> {
+        if b.len() != REGS_SIZE {
+            return Err(Error::Protocol(format!(
+                "register read reply of {} bytes",
+                b.len()
+            )));
+        }
+        let u64_at = |off: usize| u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+        let mut regs = X86Registers::default();
+        let mut off = 0;
+        for v in regs.u64_fields() {
+            *v = u64_at(off);
+            off += 8;
+        }
+        for seg in regs.segments() {
+            seg.base = u64_at(off);
+            seg.limit = u32::from_le_bytes(b[off + 8..off + 12].try_into().unwrap());
+            seg.selector = u16::from_le_bytes(b[off + 12..off + 14].try_into().unwrap());
+            off += SEG_SIZE;
+        }
+        for dtr in [&mut regs.gdtr, &mut regs.idtr] {
+            dtr.base = u64_at(off);
+            dtr.limit = u16::from_le_bytes(b[off + 8..off + 10].try_into().unwrap());
+            off += SEG_SIZE;
+        }
+        Ok(regs)
+    }
 }
 
 /// A connection to the VBoxVMI server of one VM, handshake done.
@@ -354,6 +533,47 @@ impl Client {
         }
     }
 
+    /// Reads the registers of vCPU `vcpu` (`VMI_MSG_REGS_READ`), in one request. Served between
+    /// two instructions of that vCPU: a consistent snapshot of it, also while the VM runs.
+    pub fn read_registers(&mut self, vcpu: u32) -> Result<X86Registers> {
+        let req = vcpu_request(vcpu);
+        let (hdr, body) = self.request(MSG_REGS_READ, &req)?;
+        match hdr.rc {
+            VERR_INVALID_CPU_ID => Err(Error::NoSuchVcpu(vcpu)),
+            rc if rc < 0 => Err(Error::Server {
+                request: "register read",
+                rc,
+            }),
+            _ => X86Registers::decode(body),
+        }
+    }
+
+    /// Writes the registers of vCPU `vcpu` (`VMI_MSG_REGS_WRITE`), in one request, all at once
+    /// between two instructions of that vCPU, also while the VM runs. All or nothing: a value the
+    /// CPU would not load (e.g. RFLAGS bit 1 clear, a reserved control register bit, an MSR value
+    /// `WRMSR` refuses) fails the write with [`Error::InvalidRegisters`]. Registers keeping their
+    /// value are not touched. Segment selectors, bases and limits are raw state: no descriptor
+    /// table load, the attributes are kept. Refused unless the VM is running or paused.
+    pub fn write_registers(&mut self, vcpu: u32, regs: &X86Registers) -> Result<()> {
+        let mut req = [0u8; 8 + REGS_SIZE];
+        req[..8].copy_from_slice(&vcpu_request(vcpu));
+        req[8..].copy_from_slice(&regs.encode());
+        let request = "register write";
+        let (hdr, body) = self.request(MSG_REGS_WRITE, &req)?;
+        match hdr.rc {
+            VERR_INVALID_CPU_ID => Err(Error::NoSuchVcpu(vcpu)),
+            VERR_INVALID_PARAMETER => Err(Error::InvalidRegisters),
+            VERR_VM_INVALID_VM_STATE => Err(Error::VmState { request }),
+            rc if rc < 0 => Err(Error::Server { request, rc }),
+            _ if !body.is_empty() => Err(Error::Protocol(format!(
+                "{} reply of {} bytes",
+                request,
+                body.len()
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// Sends a request and waits for its reply. Returns the reply header and body (valid until
     /// the next message); the caller checks the status.
     fn request(&mut self, kind: u16, body: &[u8]) -> Result<(Header, &[u8])> {
@@ -447,6 +667,13 @@ impl Client {
     }
 }
 
+/// `VMIVCPUREQ` body.
+fn vcpu_request(vcpu: u32) -> [u8; 8] {
+    let mut req = [0u8; 8];
+    req[0..4].copy_from_slice(&vcpu.to_le_bytes());
+    req
+}
+
 fn check_hello(body: &[u8]) -> Result<()> {
     let (magic, version) = decode_hello(body)?;
     if magic != MAGIC {
@@ -514,5 +741,68 @@ mod tests {
         );
         assert_eq!(Header::decode(&b), hdr);
         assert_eq!(&MAGIC.to_le_bytes(), b"BVMI");
+    }
+
+    #[test]
+    fn registers_layout_matches_vmix86regs() {
+        let regs = X86Registers {
+            rax: 1,
+            rcx: 2,
+            r15: 16,
+            rip: 0x11,
+            rflags: 0x202,
+            cr0: 0x13,
+            efer: 0x17,
+            apic_base: 0x1d,
+            es: Segment {
+                base: 0xe5,
+                limit: 0xe4,
+                selector: 0xe2,
+            },
+            cs: Segment {
+                base: 0xc5,
+                limit: 0xc4,
+                selector: 0x10,
+            },
+            tr: Segment {
+                base: 0x75,
+                limit: 0x74,
+                selector: 0x40,
+            },
+            gdtr: TableRegister {
+                base: 0x9d,
+                limit: 0x7f,
+            },
+            idtr: TableRegister {
+                base: 0x1d7,
+                limit: 0xfff,
+            },
+            ..Default::default()
+        };
+        let b = regs.encode();
+        let u64_at = |off: usize| u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+        // offsets of VMIX86REGS in VBoxVMI-protocol.md
+        assert_eq!(u64_at(0), 1);
+        assert_eq!(u64_at(8), 2);
+        assert_eq!(u64_at(120), 16);
+        assert_eq!(u64_at(128), 0x11);
+        assert_eq!(u64_at(136), 0x202);
+        assert_eq!(u64_at(144), 0x13);
+        assert_eq!(u64_at(176), 0x17);
+        assert_eq!(u64_at(224), 0x1d);
+        assert_eq!(
+            &b[232..248],
+            &[0xe5, 0, 0, 0, 0, 0, 0, 0, 0xe4, 0, 0, 0, 0xe2, 0, 0, 0]
+        );
+        assert_eq!(u64_at(248), 0xc5);
+        assert_eq!(&b[256..260], &[0xc4, 0, 0, 0]);
+        assert_eq!(&b[260..262], &[0x10, 0]);
+        assert_eq!(u64_at(344), 0x75);
+        assert_eq!(u64_at(360), 0x9d);
+        assert_eq!(&b[368..376], &[0x7f, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(u64_at(376), 0x1d7);
+        assert_eq!(&b[384..392], &[0xff, 0x0f, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(X86Registers::decode(&b).unwrap(), regs);
+        assert!(X86Registers::decode(&b[1..]).is_err());
     }
 }
