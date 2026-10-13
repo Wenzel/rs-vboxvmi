@@ -15,3 +15,5 @@ branch `vmi/vboxvmi` of https://github.com/Wenzel/virtualbox). Linux only.
 
 The `events` example accepts `breakpoint` instead of `singlestep` if the guest will execute
 an `int3`. It clears the Intercept after one event and replies, reinjecting #BP for a breakpoint.
+`cr <0|3|4>` and `msr <index>` (decimal, or hex with a `0x` prefix; e.g. `msr 0xc0000080`) wait for one control register or MSR
+write (VT-x only) and print vCPU, register, old and new value; the write then proceeds unchanged.

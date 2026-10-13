@@ -38,6 +38,8 @@ const MSG_EVENT_REPLY: u16 = 0x0c;
 /// `VMIINTERCEPT` and `VMIEVENT` kinds.
 const INTERCEPT_BREAKPOINT: u32 = 1;
 const INTERCEPT_SINGLESTEP: u32 = 2;
+const INTERCEPT_CR_WRITE: u32 = 3;
+const INTERCEPT_MSR_WRITE: u32 = 4;
 const EVENT_REPLY_F_REINJECT: u32 = 1;
 const MSG_EVENT: u16 = 0x0d;
 /// Guest page size: physical reads have a status per guest page.
@@ -90,7 +92,7 @@ pub enum Error {
     NotParked(u32),
     #[error("VBoxVMI event reply refused (VERR_INVALID_PARAMETER): only a breakpoint event can be reinjected; the vCPU stays parked")]
     InvalidReply,
-    #[error("VBoxVMI {request} is not supported on this VM (single step needs VT-x with the monitor trap flag)")]
+    #[error("VBoxVMI {request} is not supported on this VM (single step, CR and MSR write intercepts need VT-x; CR only 0, 3 and 4)")]
     NotSupported { request: &'static str },
 }
 
@@ -101,6 +103,10 @@ pub enum InterceptKind {
     Breakpoint,
     /// Every instruction boundary of the vCPU.
     Singlestep,
+    /// A write to control register 0, 3 or 4 (`MOV CRx`), before it takes effect.
+    CrWrite(u32),
+    /// A `WRMSR` to the MSR with this index, before it takes effect.
+    MsrWrite(u32),
 }
 
 /// A VMI event (`VMIEVENT`) received from the server.
@@ -119,6 +125,12 @@ pub enum EventKind {
     /// At the next instruction boundary; `gpa` is the physical address at RIP, `u64::MAX` if RIP
     /// is not mapped (a step onto a page the guest has not faulted in yet).
     Singlestep { gpa: u64 },
+    /// A `MOV CRx` about to write `new` (CR3: PCID no-flush bit 63 cleared) over `old`; RIP at the
+    /// instruction, which executes unchanged after a reply without reinjection.
+    CrWrite { cr: u32, old: u64, new: u64 },
+    /// A `WRMSR` about to write `new` (EDX:EAX) over `old` (0 if VirtualBox does not implement the
+    /// MSR); RIP at the instruction, which executes unchanged after a reply without reinjection.
+    MsrWrite { msr: u32, old: u64, new: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -737,11 +749,17 @@ impl Client {
     }
 
     fn intercept(&mut self, msg: u16, vcpu: u32, kind: InterceptKind) -> Result<()> {
-        let (code, request) = match kind {
-            InterceptKind::Breakpoint => (INTERCEPT_BREAKPOINT, "breakpoint intercept"),
-            InterceptKind::Singlestep => (INTERCEPT_SINGLESTEP, "single-step intercept"),
+        let (code, reg, request) = match kind {
+            InterceptKind::Breakpoint => (INTERCEPT_BREAKPOINT, 0, "breakpoint intercept"),
+            InterceptKind::Singlestep => (INTERCEPT_SINGLESTEP, 0, "single-step intercept"),
+            InterceptKind::CrWrite(cr) => (INTERCEPT_CR_WRITE, cr, "CR write intercept"),
+            InterceptKind::MsrWrite(msr) => (INTERCEPT_MSR_WRITE, msr, "MSR write intercept"),
         };
-        let (hdr, body) = self.request(msg, &u32_pair(vcpu, code))?;
+        // VMIINTERCEPT: idCpu, uKind, uReg, u32Reserved.
+        let mut req = [0u8; 16];
+        req[..8].copy_from_slice(&u32_pair(vcpu, code));
+        req[8..12].copy_from_slice(&reg.to_le_bytes());
+        let (hdr, body) = self.request(msg, &req)?;
         match hdr.rc {
             VERR_INVALID_CPU_ID => Err(Error::NoSuchVcpu(vcpu)),
             VERR_DBGF_ALREADY_ATTACHED => Err(Error::DebuggerAttached),
@@ -823,20 +841,23 @@ impl Client {
             return Err(Error::Protocol(format!("unexpected event {:?}", hdr)));
         }
         let body = self.body(hdr);
-        if body.len() != 24 {
+        if body.len() != 40 {
             return Err(Error::Protocol(format!(
                 "event body of {} bytes",
                 body.len()
             )));
         }
-        let vcpu = u32::from_le_bytes(body[0..4].try_into().unwrap());
-        let kind = u32::from_le_bytes(body[4..8].try_into().unwrap());
-        let gpa = u64::from_le_bytes(body[8..16].try_into().unwrap());
-        let insn_len = u32::from_le_bytes(body[16..20].try_into().unwrap());
-        let reserved = u32::from_le_bytes(body[20..24].try_into().unwrap());
-        let kind = match (kind, insn_len, reserved) {
-            (INTERCEPT_BREAKPOINT, len, 0) => EventKind::Breakpoint { gpa, insn_len: len },
-            (INTERCEPT_SINGLESTEP, 0, 0) => EventKind::Singlestep { gpa },
+        let u32_at = |o: usize| u32::from_le_bytes(body[o..o + 4].try_into().unwrap());
+        let u64_at = |o: usize| u64::from_le_bytes(body[o..o + 8].try_into().unwrap());
+        let (vcpu, kind, gpa, insn_len) = (u32_at(0), u32_at(4), u64_at(8), u32_at(16));
+        let (reg, old, new) = (u32_at(20), u64_at(24), u64_at(32));
+        let kind = match (kind, gpa, insn_len, reg, old, new) {
+            (INTERCEPT_BREAKPOINT, gpa, len, 0, 0, 0) => {
+                EventKind::Breakpoint { gpa, insn_len: len }
+            }
+            (INTERCEPT_SINGLESTEP, gpa, 0, 0, 0, 0) => EventKind::Singlestep { gpa },
+            (INTERCEPT_CR_WRITE, 0, 0, cr, old, new) => EventKind::CrWrite { cr, old, new },
+            (INTERCEPT_MSR_WRITE, 0, 0, msr, old, new) => EventKind::MsrWrite { msr, old, new },
             _ => return Err(Error::Protocol(format!("invalid event body {:02x?}", body))),
         };
         Ok(Event { vcpu, kind })
@@ -945,8 +966,7 @@ impl Client {
     }
 }
 
-/// An 8-byte body of two `u32`: `VMIHELLO`, `VMIVCPUREQ` (vCPU, reserved 0), `VMIINTERCEPT`,
-/// `VMIEVENTREPLY`.
+/// An 8-byte body of two `u32`: `VMIHELLO`, `VMIVCPUREQ` (vCPU, reserved 0), `VMIEVENTREPLY`.
 fn u32_pair(first: u32, second: u32) -> [u8; 8] {
     let mut b = [0u8; 8];
     b[0..4].copy_from_slice(&first.to_le_bytes());
@@ -1179,12 +1199,18 @@ mod tests {
     fn intercept_and_event_reply_layout_matches_contract() {
         let (mut client, server) = write_test_pair();
         let worker = std::thread::spawn(move || {
-            // VMI_MSG_INTERCEPT_SET, _CLEAR, VMI_MSG_EVENT_REPLY; (idCpu, uKind / fFlags).
+            // VMI_MSG_INTERCEPT_SET, _CLEAR (idCpu, uKind, uReg, reserved), VMI_MSG_EVENT_REPLY
+            // (idCpu, fFlags).
             for (kind, body) in [
-                (0x0a, [3, 0, 0, 0, 1, 0, 0, 0]),
-                (0x0b, [3, 0, 0, 0, 2, 0, 0, 0]),
-                (0x0c, [1, 0, 0, 0, 1, 0, 0, 0]),
-                (0x0c, [1, 0, 0, 0, 0, 0, 0, 0]),
+                (0x0a, &[3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..]),
+                (0x0b, &[3, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                (0x0a, &[1, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0]),
+                (
+                    0x0b,
+                    &[1, 0, 0, 0, 4, 0, 0, 0, 0x80, 0, 0, 0xc0, 0, 0, 0, 0],
+                ),
+                (0x0c, &[1, 0, 0, 0, 1, 0, 0, 0]),
+                (0x0c, &[1, 0, 0, 0, 0, 0, 0, 0]),
             ] {
                 let (hdr, got) = test_request(&server, kind);
                 assert_eq!(got, body);
@@ -1194,6 +1220,10 @@ mod tests {
         client.set_intercept(3, InterceptKind::Breakpoint).unwrap();
         client
             .clear_intercept(3, InterceptKind::Singlestep)
+            .unwrap();
+        client.set_intercept(1, InterceptKind::CrWrite(4)).unwrap();
+        client
+            .clear_intercept(1, InterceptKind::MsrWrite(0xc000_0080))
             .unwrap();
         client.reply_event(1, true).unwrap();
         client.reply_event(1, false).unwrap();
@@ -1260,18 +1290,77 @@ mod tests {
     }
 
     /// A `VMIEVENT` body at the contract's offsets.
-    fn event_body(vcpu: u32, kind: u32, gpa: u64, insn_len: u32) -> [u8; 24] {
-        let mut b = [0xffu8; 24];
+    fn event_body(
+        vcpu: u32,
+        kind: u32,
+        gpa: u64,
+        insn_len: u32,
+        reg: u32,
+        old: u64,
+        new: u64,
+    ) -> [u8; 40] {
+        let mut b = [0u8; 40];
         b[0..4].copy_from_slice(&vcpu.to_le_bytes());
         b[4..8].copy_from_slice(&kind.to_le_bytes());
         b[8..16].copy_from_slice(&gpa.to_le_bytes());
         b[16..20].copy_from_slice(&insn_len.to_le_bytes());
-        b[20..24].copy_from_slice(&0u32.to_le_bytes());
+        b[20..24].copy_from_slice(&reg.to_le_bytes());
+        b[24..32].copy_from_slice(&old.to_le_bytes());
+        b[32..40].copy_from_slice(&new.to_le_bytes());
         b
     }
 
     fn send_event(fd: &OwnedFd, vcpu: u32, kind: u32, gpa: u64, insn_len: u32) {
-        test_send(fd, 0, 0x0d, 0, 0, &event_body(vcpu, kind, gpa, insn_len));
+        test_send(
+            fd,
+            0,
+            0x0d,
+            0,
+            0,
+            &event_body(vcpu, kind, gpa, insn_len, 0, 0, 0),
+        );
+    }
+
+    #[test]
+    fn cr_and_msr_events_decode_and_cr_reinjection_is_refused() {
+        let (mut client, server) = write_test_pair();
+        let worker = std::thread::spawn(move || {
+            let cr = event_body(1, 3, 0, 0, 3, 0x1000, 0x2000);
+            test_send(&server, 0, 0x0d, 0, 0, &cr);
+            let msr = event_body(0, 4, 0, 0, 0xc000_0080, 0xd01, 0x501);
+            test_send(&server, 0, 0x0d, 0, 0, &msr);
+            let (hdr, body) = test_request(&server, 0x0c);
+            assert_eq!(body, [1, 0, 0, 0, 1, 0, 0, 0]);
+            write_test_reply(&server, hdr, -2, &[]);
+            server
+        });
+        assert_eq!(
+            client.wait_event(Duration::from_secs(10)).unwrap(),
+            Some(Event {
+                vcpu: 1,
+                kind: EventKind::CrWrite {
+                    cr: 3,
+                    old: 0x1000,
+                    new: 0x2000
+                }
+            })
+        );
+        assert_eq!(
+            client.wait_event(Duration::from_secs(10)).unwrap(),
+            Some(Event {
+                vcpu: 0,
+                kind: EventKind::MsrWrite {
+                    msr: 0xc000_0080,
+                    old: 0xd01,
+                    new: 0x501
+                }
+            })
+        );
+        assert!(matches!(
+            client.reply_event(1, true),
+            Err(Error::InvalidReply)
+        ));
+        worker.join().unwrap();
     }
 
     #[test]
@@ -1343,7 +1432,14 @@ mod tests {
         let worker = std::thread::spawn(move || {
             let (hdr, _) = test_request(&server, MSG_VCPU_COUNT);
             // An event must have idReq 0.
-            test_send(&server, hdr.id, 0x0d, 0, 0, &event_body(0, 1, 0, 1));
+            test_send(
+                &server,
+                hdr.id,
+                0x0d,
+                0,
+                0,
+                &event_body(0, 1, 0, 1, 0, 0, 0),
+            );
             test_send(&server, 9, MSG_PAUSE, MSG_F_REPLY, 0, &[]);
             server
         });
