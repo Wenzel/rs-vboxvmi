@@ -40,8 +40,22 @@ const INTERCEPT_BREAKPOINT: u32 = 1;
 const INTERCEPT_SINGLESTEP: u32 = 2;
 const INTERCEPT_CR_WRITE: u32 = 3;
 const INTERCEPT_MSR_WRITE: u32 = 4;
+const INTERCEPT_PAGE_ACCESS: u32 = 5;
 const EVENT_REPLY_F_REINJECT: u32 = 1;
+/// `VMIEVENTREPLY` actions and the maximum emulation read data.
+const EVENT_REPLY_CONTINUE: u32 = 0;
+const EVENT_REPLY_EMULATE: u32 = 1;
+const EVENT_REPLY_EMULATE_READ_DATA: u32 = 2;
+const EVENT_REPLY_EMULATE_INSN: u32 = 3;
+const EVENT_REPLY_DATA_MAX: usize = 256;
 const MSG_EVENT: u16 = 0x0d;
+const MSG_PAGE_ACCESS_SET: u16 = 0x0e;
+const MSG_PAGE_ACCESS_GET: u16 = 0x0f;
+/// Page access bits (`fAccess`): the access a Page access restriction allows, or the single
+/// access a page-access event attempted.
+pub const PAGE_ACCESS_R: u32 = 1;
+pub const PAGE_ACCESS_W: u32 = 2;
+pub const PAGE_ACCESS_X: u32 = 4;
 /// Guest page size: physical reads have a status per guest page.
 pub const PAGE_SIZE: u64 = 4096;
 /// `VMIPHYSRANGE` and `VMIRAMRANGE` size.
@@ -84,15 +98,13 @@ pub enum Error {
     NoSuchVcpu(u32),
     #[error("VBoxVMI register write refused (VERR_INVALID_PARAMETER): a value the CPU would not load (RFLAGS, control register, EFER or MSR), or a nonzero reserved field; nothing was written")]
     InvalidRegisters,
-    #[error(
-        "VBoxVMI intercept refused: the VirtualBox debugger is attached to the VM; detach it first"
-    )]
+    #[error("VBoxVMI intercept or page access refused: the VirtualBox debugger is attached to the VM; detach it first")]
     DebuggerAttached,
     #[error("VBoxVMI event reply refused: vCPU {0} is not waiting for a reply")]
     NotParked(u32),
-    #[error("VBoxVMI event reply refused (VERR_INVALID_PARAMETER): only a breakpoint event can be reinjected; the vCPU stays parked")]
+    #[error("VBoxVMI event reply refused (VERR_INVALID_PARAMETER): it does not fit the event (reinjection only at a breakpoint event, emulation and read data only at a page-access event, instruction bytes only at a breakpoint event); the vCPU stays parked")]
     InvalidReply,
-    #[error("VBoxVMI {request} is not supported on this VM (single step, CR and MSR write intercepts need VT-x; CR only 0, 3 and 4)")]
+    #[error("VBoxVMI {request} is not supported on this VM (single step, CR, MSR and page access intercepts and page access need VT-x; CR only 0, 3 and 4; execute-only page access needs EPT execute-only support)")]
     NotSupported { request: &'static str },
 }
 
@@ -107,6 +119,9 @@ pub enum InterceptKind {
     CrWrite(u32),
     /// A `WRMSR` to the MSR with this index, before it takes effect.
     MsrWrite(u32),
+    /// A vCPU access a Page access restriction denies (see [`Client::set_page_access`]), before
+    /// it takes effect. Without it, the vCPU performs the access unreported.
+    PageAccess,
 }
 
 /// A VMI event (`VMIEVENT`) received from the server.
@@ -131,6 +146,27 @@ pub enum EventKind {
     /// A `WRMSR` about to write `new` (EDX:EAX) over `old` (0 if VirtualBox does not implement the
     /// MSR); RIP at the instruction, which executes unchanged after a reply without reinjection.
     MsrWrite { msr: u32, old: u64, new: u64 },
+    /// A vCPU `access` (one `PAGE_ACCESS_*` bit) to `gpa` denied by a Page access restriction,
+    /// before it takes effect; `gva` is the guest-linear address, 0 if the CPU reported none. RIP
+    /// at the instruction; a [`Reply::Continue`] retries the access, reinjection is refused.
+    PageAccess { gpa: u64, gva: u64, access: u32 },
+}
+
+/// How [`Client::reply_event`] releases a parked vCPU (`VMIEVENTREPLY`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reply<'a> {
+    /// Continue at RIP: the instruction executes, a page access is retried (it faults again
+    /// unless the restriction was lifted). `reinject` delivers a breakpoint event's #BP to the
+    /// guest as if it had not been intercepted; refused for other events.
+    Continue { reinject: bool },
+    /// At a page-access event: run the instruction once with every Page access restriction
+    /// ignored.
+    Emulate,
+    /// At a page-access event: like [`Reply::Emulate`], the instruction's memory reads returning
+    /// these 1 to 256 bytes in order.
+    EmulateReadData(&'a [u8]),
+    /// At a breakpoint event: run these instruction bytes at RIP instead of guest memory.
+    EmulateInsn([u8; 16]),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -754,6 +790,7 @@ impl Client {
             InterceptKind::Singlestep => (INTERCEPT_SINGLESTEP, 0, "single-step intercept"),
             InterceptKind::CrWrite(cr) => (INTERCEPT_CR_WRITE, cr, "CR write intercept"),
             InterceptKind::MsrWrite(msr) => (INTERCEPT_MSR_WRITE, msr, "MSR write intercept"),
+            InterceptKind::PageAccess => (INTERCEPT_PAGE_ACCESS, 0, "page access intercept"),
         };
         // VMIINTERCEPT: idCpu, uKind, uReg, u32Reserved.
         let mut req = [0u8; 16];
@@ -774,14 +811,37 @@ impl Client {
         }
     }
 
-    /// Releases the parked vCPU `vcpu` after its event (`VMI_MSG_EVENT_REPLY`). Without
-    /// `reinject` it continues at its RIP; with it the guest gets the #BP of a breakpoint event as
-    /// if it had not been intercepted ([`Error::InvalidReply`] for another event). A reply while
-    /// the VM is paused succeeds; the vCPU continues once the VM is resumed.
-    pub fn reply_event(&mut self, vcpu: u32, reinject: bool) -> Result<()> {
-        let flags = if reinject { EVENT_REPLY_F_REINJECT } else { 0 };
+    /// Releases the parked vCPU `vcpu` after its event (`VMI_MSG_EVENT_REPLY`), see [`Reply`]. A
+    /// reply that does not fit the event fails with [`Error::InvalidReply`], an emulation the
+    /// server cannot perform with [`Error::Server`]; either way the vCPU stays parked, untouched,
+    /// and can be replied to again. An emulation reply returns once the vCPU ran the instruction.
+    /// A reply while the VM is paused succeeds; the vCPU continues once the VM is resumed.
+    pub fn reply_event(&mut self, vcpu: u32, reply: Reply<'_>) -> Result<()> {
+        let (flags, action, data): (u32, u32, &[u8]) = match &reply {
+            Reply::Continue { reinject: true } => {
+                (EVENT_REPLY_F_REINJECT, EVENT_REPLY_CONTINUE, &[])
+            }
+            Reply::Continue { reinject: false } => (0, EVENT_REPLY_CONTINUE, &[]),
+            Reply::Emulate => (0, EVENT_REPLY_EMULATE, &[]),
+            Reply::EmulateReadData(data) if (1..=EVENT_REPLY_DATA_MAX).contains(&data.len()) => {
+                (0, EVENT_REPLY_EMULATE_READ_DATA, data)
+            }
+            Reply::EmulateReadData(data) => {
+                return Err(Error::Protocol(format!(
+                    "emulation read data of {} bytes (1 to {})",
+                    data.len(),
+                    EVENT_REPLY_DATA_MAX
+                )))
+            }
+            Reply::EmulateInsn(insn) => (0, EVENT_REPLY_EMULATE_INSN, insn),
+        };
+        // VMIEVENTREPLY: idCpu, fFlags, uAction, cbData, abData.
+        let mut req = [0u8; 16 + EVENT_REPLY_DATA_MAX];
+        req[..8].copy_from_slice(&u32_pair(vcpu, flags));
+        req[8..16].copy_from_slice(&u32_pair(action, data.len() as u32));
+        req[16..16 + data.len()].copy_from_slice(data);
         let request = "event reply";
-        let (hdr, body) = self.request(MSG_EVENT_REPLY, &u32_pair(vcpu, flags))?;
+        let (hdr, body) = self.request(MSG_EVENT_REPLY, &req[..16 + data.len()])?;
         match hdr.rc {
             VERR_INVALID_CPU_ID => Err(Error::NoSuchVcpu(vcpu)),
             VERR_INVALID_STATE => Err(Error::NotParked(vcpu)),
@@ -793,6 +853,43 @@ impl Client {
                 body.len()
             ))),
             _ => Ok(()),
+        }
+    }
+
+    /// Restricts the page holding `gpa` to the `allowed` accesses (`PAGE_ACCESS_*` bits) for the
+    /// whole VM (`VMI_MSG_PAGE_ACCESS_SET`); all three bits remove the restriction. vCPUs with the
+    /// [`InterceptKind::PageAccess`] Intercept raise an [`EventKind::PageAccess`] on a denied
+    /// access. Idempotent; allowed while the VM runs or is paused, also while handling an event.
+    /// Write without read, MMIO, ROM and addresses without memory are refused with
+    /// [`Error::Server`]; restricting while the VirtualBox debugger is attached with
+    /// [`Error::DebuggerAttached`].
+    pub fn set_page_access(&mut self, gpa: u64, allowed: u32) -> Result<()> {
+        let request = "page access set";
+        let (hdr, body) = self.request(MSG_PAGE_ACCESS_SET, &page_access(gpa, allowed))?;
+        match hdr.rc {
+            VERR_DBGF_ALREADY_ATTACHED => Err(Error::DebuggerAttached),
+            VERR_NOT_SUPPORTED => Err(Error::NotSupported { request }),
+            rc if rc < 0 => Err(Error::Server { request, rc }),
+            _ if !body.is_empty() => Err(Error::Protocol(format!(
+                "{} reply of {} bytes",
+                request,
+                body.len()
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// The accesses allowed on the page holding `gpa` (`VMI_MSG_PAGE_ACCESS_GET`): all three
+    /// `PAGE_ACCESS_*` bits if it was never restricted.
+    pub fn get_page_access(&mut self, gpa: u64) -> Result<u32> {
+        let request = "page access get";
+        let (hdr, body) = self.request(MSG_PAGE_ACCESS_GET, &page_access(gpa, 0))?;
+        match hdr.rc {
+            VERR_NOT_SUPPORTED => Err(Error::NotSupported { request }),
+            rc if rc < 0 => Err(Error::Server { request, rc }),
+            _ => Ok(u32::from_le_bytes(body.try_into().map_err(|_| {
+                Error::Protocol(format!("{} reply of {} bytes", request, body.len()))
+            })?)),
         }
     }
 
@@ -858,6 +955,14 @@ impl Client {
             (INTERCEPT_SINGLESTEP, gpa, 0, 0, 0, 0) => EventKind::Singlestep { gpa },
             (INTERCEPT_CR_WRITE, 0, 0, cr, old, new) => EventKind::CrWrite { cr, old, new },
             (INTERCEPT_MSR_WRITE, 0, 0, msr, old, new) => EventKind::MsrWrite { msr, old, new },
+            (
+                INTERCEPT_PAGE_ACCESS,
+                gpa,
+                0,
+                access @ (PAGE_ACCESS_R | PAGE_ACCESS_W | PAGE_ACCESS_X),
+                gva,
+                0,
+            ) => EventKind::PageAccess { gpa, gva, access },
             _ => return Err(Error::Protocol(format!("invalid event body {:02x?}", body))),
         };
         Ok(Event { vcpu, kind })
@@ -966,11 +1071,20 @@ impl Client {
     }
 }
 
-/// An 8-byte body of two `u32`: `VMIHELLO`, `VMIVCPUREQ` (vCPU, reserved 0), `VMIEVENTREPLY`.
+/// Two `u32`: the `VMIHELLO` and `VMIVCPUREQ` (vCPU, reserved 0) bodies, and field pairs of
+/// `VMIINTERCEPT` and `VMIEVENTREPLY`.
 fn u32_pair(first: u32, second: u32) -> [u8; 8] {
     let mut b = [0u8; 8];
     b[0..4].copy_from_slice(&first.to_le_bytes());
     b[4..8].copy_from_slice(&second.to_le_bytes());
+    b
+}
+
+/// `VMIPAGEACCESS`: GCPhys, fAccess, reserved 0.
+fn page_access(gpa: u64, access: u32) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&gpa.to_le_bytes());
+    b[8..12].copy_from_slice(&access.to_le_bytes());
     b
 }
 
@@ -1200,7 +1314,7 @@ mod tests {
         let (mut client, server) = write_test_pair();
         let worker = std::thread::spawn(move || {
             // VMI_MSG_INTERCEPT_SET, _CLEAR (idCpu, uKind, uReg, reserved), VMI_MSG_EVENT_REPLY
-            // (idCpu, fFlags).
+            // (idCpu, fFlags, uAction, cbData).
             for (kind, body) in [
                 (0x0a, &[3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..]),
                 (0x0b, &[3, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
@@ -1209,8 +1323,8 @@ mod tests {
                     0x0b,
                     &[1, 0, 0, 0, 4, 0, 0, 0, 0x80, 0, 0, 0xc0, 0, 0, 0, 0],
                 ),
-                (0x0c, &[1, 0, 0, 0, 1, 0, 0, 0]),
-                (0x0c, &[1, 0, 0, 0, 0, 0, 0, 0]),
+                (0x0c, &[1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                (0x0c, &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
             ] {
                 let (hdr, got) = test_request(&server, kind);
                 assert_eq!(got, body);
@@ -1225,8 +1339,68 @@ mod tests {
         client
             .clear_intercept(1, InterceptKind::MsrWrite(0xc000_0080))
             .unwrap();
-        client.reply_event(1, true).unwrap();
-        client.reply_event(1, false).unwrap();
+        client
+            .reply_event(1, Reply::Continue { reinject: true })
+            .unwrap();
+        client
+            .reply_event(1, Reply::Continue { reinject: false })
+            .unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn emulation_reply_layout_matches_contract() {
+        let (mut client, server) = write_test_pair();
+        let insn: [u8; 16] = core::array::from_fn(|i| 0x90 + i as u8);
+        let worker = std::thread::spawn(move || {
+            // uAction 1 EMULATE, 2 EMULATE_READ_DATA, 3 EMULATE_INSN; abData after 16 bytes.
+            let mut expected = vec![
+                vec![2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+                vec![
+                    2, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0xaa, 0xbb, 0xcc,
+                ],
+                [
+                    vec![0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 16, 0, 0, 0],
+                    insn.to_vec(),
+                ]
+                .concat(),
+            ];
+            let mut max = vec![2, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1, 0, 0];
+            max.extend([0x5a; 256]);
+            expected.push(max);
+            for body in expected {
+                let (hdr, got) = test_request(&server, 0x0c);
+                assert_eq!(got, body);
+                write_test_reply(&server, hdr, 0, &[]);
+            }
+            // IEM could not emulate: the vCPU stays parked, the status comes back.
+            let (hdr, _) = test_request(&server, 0x0c);
+            write_test_reply(&server, hdr, -5391, &[]);
+        });
+        client.reply_event(2, Reply::Emulate).unwrap();
+        client
+            .reply_event(2, Reply::EmulateReadData(&[0xaa, 0xbb, 0xcc]))
+            .unwrap();
+        client.reply_event(0, Reply::EmulateInsn(insn)).unwrap();
+        // Refused without a request: the server's next message must be the 256-byte reply.
+        assert!(matches!(
+            client.reply_event(2, Reply::EmulateReadData(&[])),
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            client.reply_event(2, Reply::EmulateReadData(&[0x5a; 257])),
+            Err(Error::Protocol(_))
+        ));
+        client
+            .reply_event(2, Reply::EmulateReadData(&[0x5a; 256]))
+            .unwrap();
+        assert!(matches!(
+            client.reply_event(2, Reply::Emulate),
+            Err(Error::Server {
+                request: "event reply",
+                rc: -5391
+            })
+        ));
         worker.join().unwrap();
     }
 
@@ -1267,23 +1441,67 @@ mod tests {
             client.clear_intercept(8, Breakpoint),
             Err(Error::NoSuchVcpu(8))
         ));
+        let cont = Reply::Continue { reinject: false };
         assert!(matches!(
-            client.reply_event(2, false),
+            client.reply_event(2, cont),
             Err(Error::NotParked(2))
         ));
         assert!(matches!(
-            client.reply_event(2, true),
+            client.reply_event(2, Reply::Continue { reinject: true }),
             Err(Error::InvalidReply)
         ));
         assert!(matches!(
-            client.reply_event(9, false),
+            client.reply_event(9, cont),
             Err(Error::NoSuchVcpu(9))
         ));
         assert!(matches!(
-            client.reply_event(2, false),
+            client.reply_event(2, cont),
             Err(Error::Server {
                 request: "event reply",
                 rc: -5
+            })
+        ));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn page_access_request_layout_matches_contract() {
+        let (mut client, server) = write_test_pair();
+        let worker = std::thread::spawn(move || {
+            // VMI_MSG_PAGE_ACCESS_SET / _GET: VMIPAGEACCESS (GCPhys, fAccess, reserved).
+            let (hdr, body) = test_request(&server, 0x0e);
+            assert_eq!(body, [0x34, 0x12, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0]);
+            write_test_reply(&server, hdr, 0, &[]);
+            let (hdr, body) = test_request(&server, 0x0f);
+            assert_eq!(body, [0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            write_test_reply(&server, hdr, 0, &[3]);
+            for rc in [-1201, -37, -1618] {
+                let (hdr, _) = test_request(&server, 0x0e);
+                write_test_reply(&server, hdr, rc, &[]);
+            }
+        });
+        client
+            .set_page_access(0x1_0000_1234, PAGE_ACCESS_R | PAGE_ACCESS_X)
+            .unwrap();
+        assert_eq!(
+            client.get_page_access(0x2000).unwrap(),
+            PAGE_ACCESS_R | PAGE_ACCESS_W
+        );
+        assert!(matches!(
+            client.set_page_access(0, PAGE_ACCESS_R),
+            Err(Error::DebuggerAttached)
+        ));
+        assert!(matches!(
+            client.set_page_access(0, PAGE_ACCESS_X),
+            Err(Error::NotSupported {
+                request: "page access set"
+            })
+        ));
+        assert!(matches!(
+            client.set_page_access(0xfee0_0000, PAGE_ACCESS_R),
+            Err(Error::Server {
+                request: "page access set",
+                rc: -1618
             })
         ));
         worker.join().unwrap();
@@ -1322,6 +1540,53 @@ mod tests {
     }
 
     #[test]
+    fn page_access_intercept_and_event_match_contract() {
+        let (mut client, server) = write_test_pair();
+        let worker = std::thread::spawn(move || {
+            let (hdr, body) = test_request(&server, 0x0a);
+            assert_eq!(body, [2, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            write_test_reply(&server, hdr, 0, &[]);
+            // GCPhys, cbInstr 0, uReg = access, GCPtr in the uOld slot, uNew 0.
+            let write = event_body(2, 5, 0x1_2345, 0, 2, 0xffff_8000_0001_2345, 0);
+            test_send(&server, 0, 0x0d, 0, 0, &write);
+            let exec_no_gva = event_body(0, 5, 0x3000, 0, 4, 0, 0);
+            test_send(&server, 0, 0x0d, 0, 0, &exec_no_gva);
+            // Two accesses at once is not a page-access event.
+            let bad = event_body(0, 5, 0x3000, 0, 3, 0, 0);
+            test_send(&server, 0, 0x0d, 0, 0, &bad);
+            server
+        });
+        client.set_intercept(2, InterceptKind::PageAccess).unwrap();
+        assert_eq!(
+            client.wait_event(Duration::from_secs(10)).unwrap(),
+            Some(Event {
+                vcpu: 2,
+                kind: EventKind::PageAccess {
+                    gpa: 0x1_2345,
+                    gva: 0xffff_8000_0001_2345,
+                    access: PAGE_ACCESS_W
+                }
+            })
+        );
+        assert_eq!(
+            client.wait_event(Duration::from_secs(10)).unwrap(),
+            Some(Event {
+                vcpu: 0,
+                kind: EventKind::PageAccess {
+                    gpa: 0x3000,
+                    gva: 0,
+                    access: PAGE_ACCESS_X
+                }
+            })
+        );
+        assert!(matches!(
+            client.wait_event(Duration::from_secs(10)),
+            Err(Error::Protocol(_))
+        ));
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn cr_and_msr_events_decode_and_cr_reinjection_is_refused() {
         let (mut client, server) = write_test_pair();
         let worker = std::thread::spawn(move || {
@@ -1330,7 +1595,7 @@ mod tests {
             let msr = event_body(0, 4, 0, 0, 0xc000_0080, 0xd01, 0x501);
             test_send(&server, 0, 0x0d, 0, 0, &msr);
             let (hdr, body) = test_request(&server, 0x0c);
-            assert_eq!(body, [1, 0, 0, 0, 1, 0, 0, 0]);
+            assert_eq!(body, [1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
             write_test_reply(&server, hdr, -2, &[]);
             server
         });
@@ -1357,7 +1622,7 @@ mod tests {
             })
         );
         assert!(matches!(
-            client.reply_event(1, true),
+            client.reply_event(1, Reply::Continue { reinject: true }),
             Err(Error::InvalidReply)
         ));
         worker.join().unwrap();

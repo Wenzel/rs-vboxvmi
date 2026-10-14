@@ -17,3 +17,6 @@ The `events` example accepts `breakpoint` instead of `singlestep` if the guest w
 an `int3`. It clears the Intercept after one event and replies, reinjecting #BP for a breakpoint.
 `cr <0|3|4>` and `msr <index>` (decimal, or hex with a `0x` prefix; e.g. `msr 0xc0000080`) wait for one control register or MSR
 write (VT-x only) and print vCPU, register, old and new value; the write then proceeds unchanged.
+`page <gpa>` (decimal or `0x` hex) denies every access to the guest-physical page holding `gpa`
+(VT-x only), prints vCPU, attempted access (1 read, 2 write, 4 execute), physical and linear
+address of the first access, then lifts the restriction and lets the access proceed.
