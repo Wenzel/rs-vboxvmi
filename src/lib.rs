@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 /// Protocol magic, the bytes "BVMI" on the wire.
 pub const MAGIC: u32 = 0x494d_5642;
 /// Protocol version spoken by this crate. Client and server must match exactly.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Maximum size of a message, header included.
 const MSG_SIZE_MAX: usize = 64 * 1024;
@@ -51,12 +51,25 @@ const EVENT_REPLY_DATA_MAX: usize = 256;
 const MSG_EVENT: u16 = 0x0d;
 const MSG_PAGE_ACCESS_SET: u16 = 0x0e;
 const MSG_PAGE_ACCESS_GET: u16 = 0x0f;
+const MSG_MEMORY_VIEWS: u16 = 0x10;
+const MSG_MEMORY_VIEW_CREATE: u16 = 0x11;
+const MSG_MEMORY_VIEW_DESTROY: u16 = 0x12;
+const MSG_MEMORY_VIEW_SWITCH: u16 = 0x13;
+const MSG_MEMORY_VIEW_REMAP: u16 = 0x14;
+const MSG_HIDDEN_PAGE_ALLOC: u16 = 0x15;
+const MSG_HIDDEN_PAGE_FREE: u16 = 0x16;
 /// Page access bits (`fAccess`): the access a Page access restriction allows, or the single
 /// access a page-access event attempted.
 pub const PAGE_ACCESS_R: u32 = 1;
 pub const PAGE_ACCESS_W: u32 = 2;
 pub const PAGE_ACCESS_X: u32 = 4;
 /// Guest page size: physical reads have a status per guest page.
+/// The Default view.
+pub const DEFAULT_MEMORY_VIEW: u16 = 0;
+/// Keep the parked vCPU's Active view in an event reply.
+pub const KEEP_MEMORY_VIEW: u16 = u16::MAX;
+/// Restore a Remap's source page.
+pub const RESTORE_PAGE: u64 = u64::MAX;
 pub const PAGE_SIZE: u64 = 4096;
 /// `VMIPHYSRANGE` and `VMIRAMRANGE` size.
 const RANGE_SIZE: usize = 16;
@@ -69,6 +82,7 @@ const VERR_VERSION_MISMATCH: i32 = -11;
 const VERR_NOT_SUPPORTED: i32 = -37;
 const VERR_ACCESS_DENIED: i32 = -38;
 const VERR_INVALID_STATE: i32 = -79;
+const VERR_OUT_OF_RESOURCES: i32 = -80;
 const VERR_RESOURCE_BUSY: i32 = -138;
 const VERR_INVALID_CPU_ID: i32 = -1018;
 const VERR_DBGF_ALREADY_ATTACHED: i32 = -1201;
@@ -104,6 +118,8 @@ pub enum Error {
     NotParked(u32),
     #[error("VBoxVMI event reply refused (VERR_INVALID_PARAMETER): it does not fit the event (reinjection only at a breakpoint event, emulation and read data only at a page-access event, instruction bytes only at a breakpoint event); the vCPU stays parked")]
     InvalidReply,
+    #[error("VBoxVMI {request} failed: the configured limit was reached")]
+    OutOfResources { request: &'static str },
     #[error("VBoxVMI {request} is not supported on this VM (single step, CR, MSR and page access intercepts and page access need VT-x; CR only 0, 3 and 4; execute-only page access needs EPT execute-only support)")]
     NotSupported { request: &'static str },
 }
@@ -129,6 +145,8 @@ pub enum InterceptKind {
 pub struct Event {
     /// The vCPU parked at this event.
     pub vcpu: u32,
+    /// The vCPU's Active view.
+    pub view: u16,
     pub kind: EventKind,
 }
 
@@ -158,15 +176,18 @@ pub enum Reply<'a> {
     /// Continue at RIP: the instruction executes, a page access is retried (it faults again
     /// unless the restriction was lifted). `reinject` delivers a breakpoint event's #BP to the
     /// guest as if it had not been intercepted; refused for other events.
-    Continue { reinject: bool },
+    Continue {
+        reinject: bool,
+        view: u16,
+    },
     /// At a page-access event: run the instruction once with every Page access restriction
     /// ignored.
-    Emulate,
+    Emulate { view: u16 },
     /// At a page-access event: like [`Reply::Emulate`], the instruction's memory reads returning
     /// these 1 to 256 bytes in order.
-    EmulateReadData(&'a [u8]),
+    EmulateReadData { data: &'a [u8], view: u16 },
     /// At a breakpoint event: run these instruction bytes at RIP instead of guest memory.
-    EmulateInsn([u8; 16]),
+    EmulateInsn { data: [u8; 16], view: u16 },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -817,35 +838,44 @@ impl Client {
     /// and can be replied to again. An emulation reply returns once the vCPU ran the instruction.
     /// A reply while the VM is paused succeeds; the vCPU continues once the VM is resumed.
     pub fn reply_event(&mut self, vcpu: u32, reply: Reply<'_>) -> Result<()> {
-        let (flags, action, data): (u32, u32, &[u8]) = match &reply {
-            Reply::Continue { reinject: true } => {
-                (EVENT_REPLY_F_REINJECT, EVENT_REPLY_CONTINUE, &[])
+        let (flags, action, data, view): (u32, u32, &[u8], u16) = match &reply {
+            Reply::Continue {
+                reinject: true,
+                view,
+            } => (EVENT_REPLY_F_REINJECT, EVENT_REPLY_CONTINUE, &[], *view),
+            Reply::Continue {
+                reinject: false,
+                view,
+            } => (0, EVENT_REPLY_CONTINUE, &[], *view),
+            Reply::Emulate { view } => (0, EVENT_REPLY_EMULATE, &[], *view),
+            Reply::EmulateReadData { data, view }
+                if (1..=EVENT_REPLY_DATA_MAX).contains(&data.len()) =>
+            {
+                (0, EVENT_REPLY_EMULATE_READ_DATA, data, *view)
             }
-            Reply::Continue { reinject: false } => (0, EVENT_REPLY_CONTINUE, &[]),
-            Reply::Emulate => (0, EVENT_REPLY_EMULATE, &[]),
-            Reply::EmulateReadData(data) if (1..=EVENT_REPLY_DATA_MAX).contains(&data.len()) => {
-                (0, EVENT_REPLY_EMULATE_READ_DATA, data)
-            }
-            Reply::EmulateReadData(data) => {
+            Reply::EmulateReadData { data, .. } => {
                 return Err(Error::Protocol(format!(
                     "emulation read data of {} bytes (1 to {})",
                     data.len(),
                     EVENT_REPLY_DATA_MAX
                 )))
             }
-            Reply::EmulateInsn(insn) => (0, EVENT_REPLY_EMULATE_INSN, insn),
+            Reply::EmulateInsn { data, view } => (0, EVENT_REPLY_EMULATE_INSN, data, *view),
         };
-        // VMIEVENTREPLY: idCpu, fFlags, uAction, cbData, abData.
-        let mut req = [0u8; 16 + EVENT_REPLY_DATA_MAX];
-        req[..8].copy_from_slice(&u32_pair(vcpu, flags));
-        req[8..16].copy_from_slice(&u32_pair(action, data.len() as u32));
-        req[16..16 + data.len()].copy_from_slice(data);
+        // VMIEVENTREPLY: idCpu, idView, reserved, fFlags, uAction, cbData, abData.
+        let mut req = [0u8; 20 + EVENT_REPLY_DATA_MAX];
+        req[..4].copy_from_slice(&vcpu.to_le_bytes());
+        req[4..6].copy_from_slice(&view.to_le_bytes());
+        req[8..16].copy_from_slice(&u32_pair(flags, action));
+        req[16..20].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        req[20..20 + data.len()].copy_from_slice(data);
         let request = "event reply";
-        let (hdr, body) = self.request(MSG_EVENT_REPLY, &req[..16 + data.len()])?;
+        let (hdr, body) = self.request(MSG_EVENT_REPLY, &req[..20 + data.len()])?;
         match hdr.rc {
             VERR_INVALID_CPU_ID => Err(Error::NoSuchVcpu(vcpu)),
             VERR_INVALID_STATE => Err(Error::NotParked(vcpu)),
             VERR_INVALID_PARAMETER => Err(Error::InvalidReply),
+            VERR_NOT_SUPPORTED => Err(Error::NotSupported { request }),
             rc if rc < 0 => Err(Error::Server { request, rc }),
             _ if !body.is_empty() => Err(Error::Protocol(format!(
                 "{} reply of {} bytes",
@@ -863,9 +893,9 @@ impl Client {
     /// Write without read, MMIO, ROM and addresses without memory are refused with
     /// [`Error::Server`]; restricting while the VirtualBox debugger is attached with
     /// [`Error::DebuggerAttached`].
-    pub fn set_page_access(&mut self, gpa: u64, allowed: u32) -> Result<()> {
+    pub fn set_page_access(&mut self, view: u16, gpa: u64, allowed: u32) -> Result<()> {
         let request = "page access set";
-        let (hdr, body) = self.request(MSG_PAGE_ACCESS_SET, &page_access(gpa, allowed))?;
+        let (hdr, body) = self.request(MSG_PAGE_ACCESS_SET, &page_access(view, gpa, allowed))?;
         match hdr.rc {
             VERR_DBGF_ALREADY_ATTACHED => Err(Error::DebuggerAttached),
             VERR_NOT_SUPPORTED => Err(Error::NotSupported { request }),
@@ -879,11 +909,11 @@ impl Client {
         }
     }
 
-    /// The accesses allowed on the page holding `gpa` (`VMI_MSG_PAGE_ACCESS_GET`): all three
-    /// `PAGE_ACCESS_*` bits if it was never restricted.
-    pub fn get_page_access(&mut self, gpa: u64) -> Result<u32> {
+    /// The accesses allowed on the page holding `gpa` in `view`
+    /// (`VMI_MSG_PAGE_ACCESS_GET`): all three `PAGE_ACCESS_*` bits if unrestricted.
+    pub fn get_page_access(&mut self, view: u16, gpa: u64) -> Result<u32> {
         let request = "page access get";
-        let (hdr, body) = self.request(MSG_PAGE_ACCESS_GET, &page_access(gpa, 0))?;
+        let (hdr, body) = self.request(MSG_PAGE_ACCESS_GET, &page_access(view, gpa, 0))?;
         match hdr.rc {
             VERR_NOT_SUPPORTED => Err(Error::NotSupported { request }),
             rc if rc < 0 => Err(Error::Server { request, rc }),
@@ -891,6 +921,76 @@ impl Client {
                 Error::Protocol(format!("{} reply of {} bytes", request, body.len()))
             })?)),
         }
+    }
+
+    /// Enables or disables Memory views for this VM.
+    pub fn enable_memory_views(&mut self, enabled: bool) -> Result<()> {
+        let request = "memory views";
+        let (hdr, body) = self.request(MSG_MEMORY_VIEWS, &(enabled as u32).to_le_bytes())?;
+        empty_reply(request, hdr, body)
+    }
+
+    /// Creates a Memory view and returns its view number.
+    pub fn create_memory_view(&mut self) -> Result<u16> {
+        let request = "memory view create";
+        let (hdr, body) = self.request(MSG_MEMORY_VIEW_CREATE, &[])?;
+        match hdr.rc {
+            VERR_NOT_SUPPORTED => Err(Error::NotSupported { request }),
+            VERR_OUT_OF_RESOURCES => Err(Error::OutOfResources { request }),
+            rc if rc < 0 => Err(Error::Server { request, rc }),
+            _ => Ok(u16::from_le_bytes(body.try_into().map_err(|_| {
+                Error::Protocol(format!("{} reply of {} bytes", request, body.len()))
+            })?)),
+        }
+    }
+
+    /// Destroys a Memory view.
+    pub fn destroy_memory_view(&mut self, view: u16) -> Result<()> {
+        self.view_request(MSG_MEMORY_VIEW_DESTROY, view, "memory view destroy")
+    }
+
+    /// Switches every vCPU to `view`.
+    pub fn switch_memory_view(&mut self, view: u16) -> Result<()> {
+        self.view_request(MSG_MEMORY_VIEW_SWITCH, view, "memory view switch")
+    }
+
+    /// Remaps `page` to `target` in `view`; [`RESTORE_PAGE`] restores the source page.
+    pub fn remap_memory_page(&mut self, view: u16, page: u64, target: u64) -> Result<()> {
+        let mut request_body = [0; 24];
+        request_body[..2].copy_from_slice(&view.to_le_bytes());
+        request_body[8..16].copy_from_slice(&page.to_le_bytes());
+        request_body[16..24].copy_from_slice(&target.to_le_bytes());
+        let request = "memory page remap";
+        let (hdr, body) = self.request(MSG_MEMORY_VIEW_REMAP, &request_body)?;
+        empty_reply(request, hdr, body)
+    }
+
+    /// Allocates one Hidden page and returns its guest-physical page number.
+    pub fn allocate_hidden_page(&mut self) -> Result<u64> {
+        let request = "hidden page allocate";
+        let (hdr, body) = self.request(MSG_HIDDEN_PAGE_ALLOC, &[])?;
+        match hdr.rc {
+            VERR_NOT_SUPPORTED => Err(Error::NotSupported { request }),
+            VERR_OUT_OF_RESOURCES => Err(Error::OutOfResources { request }),
+            rc if rc < 0 => Err(Error::Server { request, rc }),
+            _ => Ok(u64::from_le_bytes(body.try_into().map_err(|_| {
+                Error::Protocol(format!("{} reply of {} bytes", request, body.len()))
+            })?)),
+        }
+    }
+
+    /// Returns a Hidden page to the pool.
+    pub fn free_hidden_page(&mut self, page: u64) -> Result<()> {
+        let request = "hidden page free";
+        let (hdr, body) = self.request(MSG_HIDDEN_PAGE_FREE, &page.to_le_bytes())?;
+        empty_reply(request, hdr, body)
+    }
+
+    fn view_request(&mut self, kind: u16, view: u16, request: &'static str) -> Result<()> {
+        let mut request_body = [0; 8];
+        request_body[..2].copy_from_slice(&view.to_le_bytes());
+        let (hdr, body) = self.request(kind, &request_body)?;
+        empty_reply(request, hdr, body)
     }
 
     /// Returns the oldest pending [`Event`], or `None` after `timeout` elapsed. A zero timeout
@@ -938,16 +1038,18 @@ impl Client {
             return Err(Error::Protocol(format!("unexpected event {:?}", hdr)));
         }
         let body = self.body(hdr);
-        if body.len() != 40 {
+        if body.len() != 48 {
             return Err(Error::Protocol(format!(
                 "event body of {} bytes",
                 body.len()
             )));
         }
+        let u16_at = |o: usize| u16::from_le_bytes(body[o..o + 2].try_into().unwrap());
         let u32_at = |o: usize| u32::from_le_bytes(body[o..o + 4].try_into().unwrap());
         let u64_at = |o: usize| u64::from_le_bytes(body[o..o + 8].try_into().unwrap());
-        let (vcpu, kind, gpa, insn_len) = (u32_at(0), u32_at(4), u64_at(8), u32_at(16));
-        let (reg, old, new) = (u32_at(20), u64_at(24), u64_at(32));
+        let (vcpu, view, kind, gpa, insn_len) =
+            (u32_at(0), u16_at(4), u32_at(8), u64_at(16), u32_at(24));
+        let (reg, old, new) = (u32_at(28), u64_at(32), u64_at(40));
         let kind = match (kind, gpa, insn_len, reg, old, new) {
             (INTERCEPT_BREAKPOINT, gpa, len, 0, 0, 0) => {
                 EventKind::Breakpoint { gpa, insn_len: len }
@@ -965,7 +1067,7 @@ impl Client {
             ) => EventKind::PageAccess { gpa, gva, access },
             _ => return Err(Error::Protocol(format!("invalid event body {:02x?}", body))),
         };
-        Ok(Event { vcpu, kind })
+        Ok(Event { vcpu, view, kind })
     }
     /// Sends a request and waits for its reply. Returns the reply header and body (valid until
     /// the next message); the caller checks the status.
@@ -1080,12 +1182,27 @@ fn u32_pair(first: u32, second: u32) -> [u8; 8] {
     b
 }
 
-/// `VMIPAGEACCESS`: GCPhys, fAccess, reserved 0.
-fn page_access(gpa: u64, access: u32) -> [u8; 16] {
-    let mut b = [0u8; 16];
-    b[0..8].copy_from_slice(&gpa.to_le_bytes());
-    b[8..12].copy_from_slice(&access.to_le_bytes());
+/// `VMIPAGEACCESS`: idView, reserved, GCPhys, fAccess, reserved.
+fn page_access(view: u16, gpa: u64, access: u32) -> [u8; 24] {
+    let mut b = [0u8; 24];
+    b[0..2].copy_from_slice(&view.to_le_bytes());
+    b[8..16].copy_from_slice(&gpa.to_le_bytes());
+    b[16..20].copy_from_slice(&access.to_le_bytes());
     b
+}
+
+fn empty_reply(request: &'static str, hdr: Header, body: &[u8]) -> Result<()> {
+    match hdr.rc {
+        VERR_NOT_SUPPORTED => Err(Error::NotSupported { request }),
+        VERR_OUT_OF_RESOURCES => Err(Error::OutOfResources { request }),
+        rc if rc < 0 => Err(Error::Server { request, rc }),
+        _ if !body.is_empty() => Err(Error::Protocol(format!(
+            "{} reply of {} bytes",
+            request,
+            body.len()
+        ))),
+        _ => Ok(()),
+    }
 }
 
 fn check_hello(body: &[u8]) -> Result<()> {
@@ -1292,18 +1409,18 @@ mod tests {
     }
 
     #[test]
-    fn version_1_greeting_is_refused() {
+    fn version_2_greeting_is_refused() {
         let (client, server) = write_test_pair();
         let worker = std::thread::spawn(move || {
-            test_send(&server, 0, MSG_HELLO, 0, 0, &u32_pair(MAGIC, 1));
+            test_send(&server, 0, MSG_HELLO, 0, 0, &u32_pair(MAGIC, 2));
             server
         });
         let err = Client::handshake(client.fd).err().unwrap();
         assert!(matches!(
             err,
             Error::VersionMismatch {
-                server: 1,
-                client: 2
+                server: 2,
+                client: 3
             }
         ));
         worker.join().unwrap();
@@ -1323,8 +1440,14 @@ mod tests {
                     0x0b,
                     &[1, 0, 0, 0, 4, 0, 0, 0, 0x80, 0, 0, 0xc0, 0, 0, 0, 0],
                 ),
-                (0x0c, &[1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-                (0x0c, &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                (
+                    0x0c,
+                    &[1, 0, 0, 0, 0xff, 0xff, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                ),
+                (
+                    0x0c,
+                    &[1, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                ),
             ] {
                 let (hdr, got) = test_request(&server, kind);
                 assert_eq!(got, body);
@@ -1340,10 +1463,10 @@ mod tests {
             .clear_intercept(1, InterceptKind::MsrWrite(0xc000_0080))
             .unwrap();
         client
-            .reply_event(1, Reply::Continue { reinject: true })
+            .reply_event(1, Reply::Continue { reinject: true, view: KEEP_MEMORY_VIEW })
             .unwrap();
         client
-            .reply_event(1, Reply::Continue { reinject: false })
+            .reply_event(1, Reply::Continue { reinject: false, view: KEEP_MEMORY_VIEW })
             .unwrap();
         worker.join().unwrap();
     }
@@ -1353,19 +1476,24 @@ mod tests {
         let (mut client, server) = write_test_pair();
         let insn: [u8; 16] = core::array::from_fn(|i| 0x90 + i as u8);
         let worker = std::thread::spawn(move || {
-            // uAction 1 EMULATE, 2 EMULATE_READ_DATA, 3 EMULATE_INSN; abData after 16 bytes.
+            // uAction 1 EMULATE, 2 EMULATE_READ_DATA, 3 EMULATE_INSN; abData after 20 bytes.
             let mut expected = vec![
-                vec![2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+                vec![2, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
                 vec![
-                    2, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0xaa, 0xbb, 0xcc,
+                    2, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0xaa,
+                    0xbb, 0xcc,
                 ],
                 [
-                    vec![0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 16, 0, 0, 0],
+                    vec![
+                        0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 16, 0, 0, 0,
+                    ],
                     insn.to_vec(),
                 ]
                 .concat(),
             ];
-            let mut max = vec![2, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1, 0, 0];
+            let mut max = vec![
+                2, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1, 0, 0,
+            ];
             max.extend([0x5a; 256]);
             expected.push(max);
             for body in expected {
@@ -1377,25 +1505,42 @@ mod tests {
             let (hdr, _) = test_request(&server, 0x0c);
             write_test_reply(&server, hdr, -5391, &[]);
         });
-        client.reply_event(2, Reply::Emulate).unwrap();
+        client.reply_event(2, Reply::Emulate { view: KEEP_MEMORY_VIEW }).unwrap();
         client
-            .reply_event(2, Reply::EmulateReadData(&[0xaa, 0xbb, 0xcc]))
+            .reply_event(2, Reply::EmulateReadData { data: &[0xaa, 0xbb, 0xcc], view: KEEP_MEMORY_VIEW })
             .unwrap();
-        client.reply_event(0, Reply::EmulateInsn(insn)).unwrap();
+        client.reply_event(0, Reply::EmulateInsn { data: insn, view: KEEP_MEMORY_VIEW }).unwrap();
         // Refused without a request: the server's next message must be the 256-byte reply.
         assert!(matches!(
-            client.reply_event(2, Reply::EmulateReadData(&[])),
+            client.reply_event(
+                2,
+                Reply::EmulateReadData {
+                    data: &[],
+                    view: KEEP_MEMORY_VIEW,
+                },
+            ),
             Err(Error::Protocol(_))
         ));
         assert!(matches!(
-            client.reply_event(2, Reply::EmulateReadData(&[0x5a; 257])),
+            client.reply_event(
+                2,
+                Reply::EmulateReadData {
+                    data: &[0x5a; 257],
+                    view: KEEP_MEMORY_VIEW,
+                },
+            ),
             Err(Error::Protocol(_))
         ));
         client
-            .reply_event(2, Reply::EmulateReadData(&[0x5a; 256]))
+            .reply_event(2, Reply::EmulateReadData { data: &[0x5a; 256], view: KEEP_MEMORY_VIEW })
             .unwrap();
         assert!(matches!(
-            client.reply_event(2, Reply::Emulate),
+            client.reply_event(
+                2,
+                Reply::Emulate {
+                    view: KEEP_MEMORY_VIEW,
+                },
+            ),
             Err(Error::Server {
                 request: "event reply",
                 rc: -5391
@@ -1441,13 +1586,19 @@ mod tests {
             client.clear_intercept(8, Breakpoint),
             Err(Error::NoSuchVcpu(8))
         ));
-        let cont = Reply::Continue { reinject: false };
+        let cont = Reply::Continue { reinject: false, view: KEEP_MEMORY_VIEW };
         assert!(matches!(
             client.reply_event(2, cont),
             Err(Error::NotParked(2))
         ));
         assert!(matches!(
-            client.reply_event(2, Reply::Continue { reinject: true }),
+            client.reply_event(
+                2,
+                Reply::Continue {
+                    reinject: true,
+                    view: KEEP_MEMORY_VIEW,
+                },
+            ),
             Err(Error::InvalidReply)
         ));
         assert!(matches!(
@@ -1468,37 +1619,42 @@ mod tests {
     fn page_access_request_layout_matches_contract() {
         let (mut client, server) = write_test_pair();
         let worker = std::thread::spawn(move || {
-            // VMI_MSG_PAGE_ACCESS_SET / _GET: VMIPAGEACCESS (GCPhys, fAccess, reserved).
+            // VMI_MSG_PAGE_ACCESS_SET / _GET: view, reserved, GCPhys, fAccess, reserved.
             let (hdr, body) = test_request(&server, 0x0e);
-            assert_eq!(body, [0x34, 0x12, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(
+                body,
+                [0, 0, 0, 0, 0, 0, 0, 0, 0x34, 0x12, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0]
+            );
             write_test_reply(&server, hdr, 0, &[]);
             let (hdr, body) = test_request(&server, 0x0f);
-            assert_eq!(body, [0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(
+                body,
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            );
             write_test_reply(&server, hdr, 0, &[3]);
             for rc in [-1201, -37, -1618] {
                 let (hdr, _) = test_request(&server, 0x0e);
                 write_test_reply(&server, hdr, rc, &[]);
             }
         });
-        client
-            .set_page_access(0x1_0000_1234, PAGE_ACCESS_R | PAGE_ACCESS_X)
+        client.set_page_access(DEFAULT_MEMORY_VIEW, 0x1_0000_1234, PAGE_ACCESS_R | PAGE_ACCESS_X)
             .unwrap();
         assert_eq!(
-            client.get_page_access(0x2000).unwrap(),
+            client.get_page_access(DEFAULT_MEMORY_VIEW, 0x2000).unwrap(),
             PAGE_ACCESS_R | PAGE_ACCESS_W
         );
         assert!(matches!(
-            client.set_page_access(0, PAGE_ACCESS_R),
+            client.set_page_access(DEFAULT_MEMORY_VIEW, 0, PAGE_ACCESS_R),
             Err(Error::DebuggerAttached)
         ));
         assert!(matches!(
-            client.set_page_access(0, PAGE_ACCESS_X),
+            client.set_page_access(DEFAULT_MEMORY_VIEW, 0, PAGE_ACCESS_X),
             Err(Error::NotSupported {
                 request: "page access set"
             })
         ));
         assert!(matches!(
-            client.set_page_access(0xfee0_0000, PAGE_ACCESS_R),
+            client.set_page_access(DEFAULT_MEMORY_VIEW, 0xfee0_0000, PAGE_ACCESS_R),
             Err(Error::Server {
                 request: "page access set",
                 rc: -1618
@@ -1516,15 +1672,16 @@ mod tests {
         reg: u32,
         old: u64,
         new: u64,
-    ) -> [u8; 40] {
-        let mut b = [0u8; 40];
+    ) -> [u8; 48] {
+        let mut b = [0u8; 48];
         b[0..4].copy_from_slice(&vcpu.to_le_bytes());
-        b[4..8].copy_from_slice(&kind.to_le_bytes());
-        b[8..16].copy_from_slice(&gpa.to_le_bytes());
-        b[16..20].copy_from_slice(&insn_len.to_le_bytes());
-        b[20..24].copy_from_slice(&reg.to_le_bytes());
-        b[24..32].copy_from_slice(&old.to_le_bytes());
-        b[32..40].copy_from_slice(&new.to_le_bytes());
+        b[4..6].copy_from_slice(&DEFAULT_MEMORY_VIEW.to_le_bytes());
+        b[8..12].copy_from_slice(&kind.to_le_bytes());
+        b[16..24].copy_from_slice(&gpa.to_le_bytes());
+        b[24..28].copy_from_slice(&insn_len.to_le_bytes());
+        b[28..32].copy_from_slice(&reg.to_le_bytes());
+        b[32..40].copy_from_slice(&old.to_le_bytes());
+        b[40..48].copy_from_slice(&new.to_le_bytes());
         b
     }
 
@@ -1561,6 +1718,7 @@ mod tests {
             client.wait_event(Duration::from_secs(10)).unwrap(),
             Some(Event {
                 vcpu: 2,
+                view: DEFAULT_MEMORY_VIEW,
                 kind: EventKind::PageAccess {
                     gpa: 0x1_2345,
                     gva: 0xffff_8000_0001_2345,
@@ -1572,6 +1730,7 @@ mod tests {
             client.wait_event(Duration::from_secs(10)).unwrap(),
             Some(Event {
                 vcpu: 0,
+                view: DEFAULT_MEMORY_VIEW,
                 kind: EventKind::PageAccess {
                     gpa: 0x3000,
                     gva: 0,
@@ -1595,7 +1754,10 @@ mod tests {
             let msr = event_body(0, 4, 0, 0, 0xc000_0080, 0xd01, 0x501);
             test_send(&server, 0, 0x0d, 0, 0, &msr);
             let (hdr, body) = test_request(&server, 0x0c);
-            assert_eq!(body, [1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(
+                body,
+                [1, 0, 0, 0, 0xff, 0xff, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            );
             write_test_reply(&server, hdr, -2, &[]);
             server
         });
@@ -1603,6 +1765,7 @@ mod tests {
             client.wait_event(Duration::from_secs(10)).unwrap(),
             Some(Event {
                 vcpu: 1,
+                view: DEFAULT_MEMORY_VIEW,
                 kind: EventKind::CrWrite {
                     cr: 3,
                     old: 0x1000,
@@ -1614,6 +1777,7 @@ mod tests {
             client.wait_event(Duration::from_secs(10)).unwrap(),
             Some(Event {
                 vcpu: 0,
+                view: DEFAULT_MEMORY_VIEW,
                 kind: EventKind::MsrWrite {
                     msr: 0xc000_0080,
                     old: 0xd01,
@@ -1622,7 +1786,13 @@ mod tests {
             })
         );
         assert!(matches!(
-            client.reply_event(1, Reply::Continue { reinject: true }),
+            client.reply_event(
+                1,
+                Reply::Continue {
+                    reinject: true,
+                    view: KEEP_MEMORY_VIEW,
+                },
+            ),
             Err(Error::InvalidReply)
         ));
         worker.join().unwrap();
@@ -1645,7 +1815,7 @@ mod tests {
         });
         client.set_intercept(0, InterceptKind::Breakpoint).unwrap();
         assert_eq!(client.vcpu_count().unwrap(), 3);
-        let event = |vcpu, kind| Some(Event { vcpu, kind });
+        let event = |vcpu, kind| Some(Event { vcpu, view: DEFAULT_MEMORY_VIEW, kind });
         assert_eq!(
             client.wait_event(Duration::ZERO).unwrap(),
             event(

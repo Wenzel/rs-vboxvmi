@@ -9,7 +9,8 @@ use std::convert::TryFrom;
 use std::error::Error;
 use std::time::Duration;
 use vboxvmi::{
-    Client, EventKind, InterceptKind, Reply, PAGE_ACCESS_R, PAGE_ACCESS_W, PAGE_ACCESS_X,
+    Client, EventKind, InterceptKind, Reply, DEFAULT_MEMORY_VIEW, KEEP_MEMORY_VIEW, PAGE_ACCESS_R,
+    PAGE_ACCESS_W, PAGE_ACCESS_X,
 };
 
 fn main() {
@@ -56,7 +57,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut client = Client::connect(&args[1])?;
     client.set_intercept(vcpu, kind)?;
     if let Some(gpa) = page {
-        client.set_page_access(gpa, 0)?;
+        client.set_page_access(DEFAULT_MEMORY_VIEW, gpa, 0)?;
     }
     let event = loop {
         if let Some(event) = client.wait_event(Duration::from_secs(5))? {
@@ -83,9 +84,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     client.clear_intercept(vcpu, kind)?;
     if let Some(gpa) = page {
-        client.set_page_access(gpa, PAGE_ACCESS_R | PAGE_ACCESS_W | PAGE_ACCESS_X)?;
+        client.set_page_access(DEFAULT_MEMORY_VIEW, gpa, PAGE_ACCESS_R | PAGE_ACCESS_W | PAGE_ACCESS_X)?;
     }
     let reinject = kind == InterceptKind::Breakpoint;
-    client.reply_event(event.vcpu, Reply::Continue { reinject })?;
+    client.reply_event(
+        event.vcpu,
+        Reply::Continue {
+            reinject,
+            view: KEEP_MEMORY_VIEW,
+        },
+    )?;
     Ok(())
 }
